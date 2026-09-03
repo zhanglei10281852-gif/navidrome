@@ -73,6 +73,26 @@ func (s *playlists) ImportFile(ctx context.Context, absolutePath string, sync bo
 
 var errNotInLibrary = fmt.Errorf("path not in any library")
 
+// PreviewFromFolder parses a playlist file without writing to the database. When a
+// playlist with the same path already exists, the returned playlist carries its ID
+// and stored name so callers can report it as "updated" rather than "new".
+func (s *playlists) PreviewFromFolder(ctx context.Context, folder *model.Folder, filename string) (*model.Playlist, error) {
+	pls, err := s.parsePlaylist(ctx, filename, folder)
+	if err != nil {
+		return nil, err
+	}
+	existing, err := s.findByPathNormalized(ctx, pls.Path)
+	if err != nil && !errors.Is(err, model.ErrNotFound) {
+		return nil, err
+	}
+	if err == nil && existing != nil && existing.ID != "" {
+		pls.ID = existing.ID
+		pls.Name = existing.Name
+		pls.SongCount = existing.SongCount
+	}
+	return pls, nil
+}
+
 func (s *playlists) resolveFolder(ctx context.Context, dir string) (*model.Folder, error) {
 	libs, err := s.ds.Library(ctx).GetAll()
 	if err != nil {

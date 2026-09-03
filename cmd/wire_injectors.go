@@ -57,6 +57,7 @@ var allProviders = wire.NewSet(
 	wire.Bind(new(core.PluginUnloader), new(*plugins.Manager)),
 	wire.Bind(new(plugins.PluginMetricsRecorder), new(metrics.Metrics)),
 	wire.Bind(new(core.Watcher), new(scanner.Watcher)),
+	wire.Bind(new(model.ScanPlanner), new(model.Scanner)),
 	wire.Bind(new(playlists.ImageUploadService), new(artwork.Uploader)),
 )
 

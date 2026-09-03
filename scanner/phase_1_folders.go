@@ -159,7 +159,14 @@ func (p *phaseFolders) producer() ppl.Producer[*folderEntry] {
 					FileCount: uint32(len(folder.audioFiles)),
 					Path:      folder.path,
 					Phase:     "1",
+					Mode:      planProgressMode(p.state.mode),
+					PlanID:    p.state.planID(),
 				})
+				if p.state.isPreview() {
+					// Feed the FS fingerprint and playlist detection for EVERY walked folder,
+					// including up-to-date ones that are never processed.
+					p.state.collector.recordWalkedFolder(job.lib.ID, folder)
+				}
 
 				// Log folder info
 				log.Trace(p.ctx, "Scanner: Checking folder state", " folder", folder.path, "_updTime", folder.updTime,
@@ -264,6 +271,23 @@ func (p *phaseFolders) processFolder(entry *folderEntry) (*folderEntry, error) {
 		p.createArtistsFromMediaFiles(entry)
 	}
 
+	if p.state.isPreview() {
+		// Preview mode: record what would be imported/flagged, write nothing. This also
+		// covers folders that lost every file (filesToImport empty but tracks vanished).
+		c := p.state.collector
+		for i := range entry.tracks {
+			track := &entry.tracks[i]
+			c.recordImported(entry.job.lib.ID, *track, filesToImport[track.Path])
+		}
+		missing := make([]model.MediaFile, 0, len(entry.missingTracks))
+		for _, mf := range entry.missingTracks {
+			missing = append(missing, *mf)
+		}
+		c.recordMissing(missing...)
+		c.recordAlbums(len(entry.albums))
+		c.recordArtists(len(entry.artists))
+	}
+
 	return entry, nil
 }
 
@@ -329,6 +353,13 @@ func (p *phaseFolders) createArtistsFromMediaFiles(entry *folderEntry) {
 
 func (p *phaseFolders) persistChanges(entry *folderEntry) (*folderEntry, error) {
 	defer p.measure(entry)()
+
+	// Preview mode: changes were recorded during processFolder; nothing is written.
+	if p.state.isPreview() {
+		p.state.changesDetected.Store(true)
+		return entry, nil
+	}
+
 	p.state.changesDetected.Store(true)
 
 	// Collect artwork queue items for changed albums/artists, enqueued in the same transaction
@@ -499,6 +530,13 @@ func (p *phaseFolders) logFolder(entry *folderEntry) (*folderEntry, error) {
 }
 
 func (p *phaseFolders) finalize(err error) error {
+	if p.state.isPreview() {
+		// Preview: collect tracks under folders that would be marked missing, without writes.
+		if errF := p.finalizePreviewMissingFolders(); errF != nil {
+			err = errors.Join(err, errF)
+		}
+		return err
+	}
 	errF := p.ds.WithTx(func(tx model.DataStore) error {
 		for _, job := range p.jobs {
 			// Mark all folders that were not updated as missing
@@ -527,6 +565,29 @@ func (p *phaseFolders) finalize(err error) error {
 	}, "scanner: finalize phaseFolders")
 	p.imageChanges.enqueue(p.ctx)
 	return errors.Join(err, errF)
+}
+
+// finalizePreviewMissingFolders mirrors the apply-mode marking of folders the walk
+// did not visit: it records the tracks that would be flagged missing, without writing.
+func (p *phaseFolders) finalizePreviewMissingFolders() error {
+	for _, job := range p.jobs {
+		if len(job.lastUpdates) == 0 {
+			continue
+		}
+		folderIDs := slices.Collect(maps.Keys(job.lastUpdates))
+		for chunk := range slices.Chunk(folderIDs, filesBatchSize) {
+			tracks, err := p.ds.MediaFile(p.ctx).GetAll(model.QueryOptions{Filters: squirrel.And{
+				squirrel.Eq{"folder_id": chunk},
+				squirrel.Eq{"missing": false},
+			}})
+			if err != nil {
+				log.Error(p.ctx, "Scanner: Error loading tracks of missing folders", "lib", job.lib.Name, err)
+				return err
+			}
+			p.state.collector.recordMissing(tracks...)
+		}
+	}
+	return nil
 }
 
 var _ phase[*folderEntry] = (*phaseFolders)(nil)

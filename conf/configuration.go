@@ -176,6 +176,7 @@ type scannerOptions struct {
 	FollowSymlinks        bool     // Whether to follow symlinks when scanning directories
 	IgnoreDotFolders      bool     // Whether to ignore folders whose name starts with a dot when scanning
 	PurgeMissing          string   // Values: "never", "always", "full"
+	ScanPlanTTL           time.Duration // How long a scan plan preview stays applicable after creation. 0 disables expiration.
 }
 
 type transcodingOptions struct {
@@ -1063,6 +1064,7 @@ func setViperDefaults() {
 	viper.SetDefault("scanner.followsymlinks", true)
 	viper.SetDefault("scanner.ignoredotfolders", true)
 	viper.SetDefault("scanner.purgemissing", consts.PurgeMissingNever)
+	viper.SetDefault("scanner.scanplanttl", 24*time.Hour)
 	viper.SetDefault("subsonic.appendsubtitle", true)
 	viper.SetDefault("subsonic.appendalbumversion", true)
 	viper.SetDefault("subsonic.artistparticipations", false)

@@ -48,10 +48,11 @@ type Router struct {
 	pluginManager PluginManager
 	imgUpload     artwork.Uploader
 	provider      external.Provider
+	planner       model.ScanPlanner
 }
 
-func New(ds model.DataStore, share core.Share, playlists playlistsvc.Playlists, insights metrics.Insights, libraryService core.Library, userService core.User, maintenance core.Maintenance, pluginManager PluginManager, imgUpload artwork.Uploader, provider external.Provider) *Router {
-	r := &Router{ds: ds, share: share, playlists: playlists, insights: insights, libs: libraryService, users: userService, maintenance: maintenance, pluginManager: pluginManager, imgUpload: imgUpload, provider: provider}
+func New(ds model.DataStore, share core.Share, playlists playlistsvc.Playlists, insights metrics.Insights, libraryService core.Library, userService core.User, maintenance core.Maintenance, pluginManager PluginManager, imgUpload artwork.Uploader, provider external.Provider, planner model.ScanPlanner) *Router {
+	r := &Router{ds: ds, share: share, playlists: playlists, insights: insights, libs: libraryService, users: userService, maintenance: maintenance, pluginManager: pluginManager, imgUpload: imgUpload, provider: provider, planner: planner}
 	r.Handler = r.routes()
 	return r
 }
@@ -96,6 +97,9 @@ func (api *Router) routes() http.Handler {
 			api.addPluginRoute(r)
 			api.addMetadataRoute(r)
 			api.RX(r, "/library", api.libs.NewRepository, true)
+			if api.planner != nil {
+				api.addScanPlanRoutes(r)
+			}
 		})
 	})
 

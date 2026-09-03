@@ -30,6 +30,7 @@ type MockDataStore struct {
 	MockedPlugin         model.PluginRepository
 	MockedArtwork        model.ArtworkRepository
 	MockedArtworkQueue   model.ArtworkQueueRepository
+	MockedScanPlan       model.ScanPlanRepository
 	scrobbleBufferMu     sync.Mutex
 	repoMu               sync.Mutex
 
@@ -321,6 +322,19 @@ func (db *MockDataStore) ArtworkQueue(ctx context.Context) model.ArtworkQueueRep
 	return db.MockedArtworkQueue
 }
 
+func (db *MockDataStore) ScanPlan(ctx context.Context) model.ScanPlanRepository {
+	db.repoMu.Lock()
+	defer db.repoMu.Unlock()
+	if db.MockedScanPlan != nil {
+		return db.MockedScanPlan
+	}
+	if db.RealDS != nil {
+		return db.RealDS.ScanPlan(ctx)
+	}
+	db.MockedScanPlan = struct{ model.ScanPlanRepository }{}
+	return db.MockedScanPlan
+}
+
 func (db *MockDataStore) WithTx(block func(tx model.DataStore) error, label ...string) error {
 	return block(db)
 }
@@ -366,4 +380,16 @@ func (db *MockDataStore) GC(context.Context, ...int) error {
 		return db.GCError
 	}
 	return nil
+}
+
+func (db *MockDataStore) GCPlanCounts(ctx context.Context, libraryIDs ...int) (model.PlanGCSummary, error) {
+	type planCounter interface {
+		GCPlanCounts(context.Context, ...int) (model.PlanGCSummary, error)
+	}
+	if db.RealDS != nil {
+		if pc, ok := db.RealDS.(planCounter); ok {
+			return pc.GCPlanCounts(ctx, libraryIDs...)
+		}
+	}
+	return model.PlanGCSummary{}, nil
 }

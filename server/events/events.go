@@ -45,6 +45,23 @@ type ScanStatus struct {
 	ElapsedTime time.Duration `json:"elapsedTime"`
 }
 
+// ScanPlanStatus reports progress of a scan-plan preview or apply. It is distinct
+// from ScanStatus so plan work never shows up as a regular library scan.
+type ScanPlanStatus struct {
+	baseEvent
+	PlanID      string `json:"planId"`
+	Mode        string `json:"mode"` // "preview" | "apply"
+	Phase       string `json:"phase"`
+	Stage       string `json:"stage"`
+	LibID       int    `json:"libId"`
+	Count       int64  `json:"count"`
+	FolderCount int64  `json:"folderCount"`
+	Path        string `json:"path"`
+	Warning     string `json:"warning,omitempty"`
+	Error       string `json:"error,omitempty"`
+	Done        bool   `json:"done,omitempty"`
+}
+
 type KeepAlive struct {
 	baseEvent
 	TS int64 `json:"ts"`

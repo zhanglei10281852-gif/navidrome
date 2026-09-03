@@ -21,10 +21,12 @@ import (
 )
 
 var (
-	fullScan   bool
-	subprocess bool
-	targets    []string
-	targetFile string
+	fullScan    bool
+	subprocess  bool
+	targets     []string
+	targetFile  string
+	previewPlan string
+	applyPlan   string
 )
 
 func init() {
@@ -32,6 +34,8 @@ func init() {
 	scanCmd.Flags().BoolVarP(&subprocess, "subprocess", "", false, "run as subprocess (internal use)")
 	scanCmd.Flags().StringArrayVarP(&targets, "target", "t", []string{}, "list of libraryID:folderPath pairs, can be repeated (e.g., \"-t 1:Music/Rock -t 1:Music/Jazz -t 2:Classical\")")
 	scanCmd.Flags().StringVar(&targetFile, "target-file", "", "path to file containing targets (one libraryID:folderPath per line)")
+	scanCmd.Flags().StringVar(&previewPlan, "preview-plan", "", "internal: run a read-only preview for the given scan plan ID")
+	scanCmd.Flags().StringVar(&applyPlan, "apply-plan", "", "internal: apply a scan plan by ID")
 	rootCmd.AddCommand(scanCmd)
 }
 
@@ -110,6 +114,57 @@ func runScanner(ctx context.Context) {
 				log.Error(ctx, "Error marking DB analysis pending", err)
 			}
 		}
+	}
+
+	// Scan plan preview (internal: invoked by the external scanner subprocess).
+	if previewPlan != "" {
+		progress := scanner.CallPreviewPlan(ctx, ds, pls, fullScan, scanTargets, previewPlan)
+		if progress == nil {
+			log.Fatal(ctx, "Failed to start plan preview")
+			return
+		}
+		if subprocess {
+			encoder := gob.NewEncoder(os.Stdout)
+			for status := range progress {
+				if err := encoder.Encode(status); err != nil {
+					log.Error(ctx, "Failed to encode status", err)
+					break
+				}
+			}
+		} else {
+			for range progress {
+				// drain
+			}
+		}
+		return
+	}
+
+	// Scan plan apply (internal): staleness gate + real scan live in RunPlanApply.
+	if applyPlan != "" {
+		progress := make(chan *scanner.ProgressInfo, 100)
+		applyErr := make(chan error, 1)
+		go func() {
+			applyErr <- scanner.RunPlanApply(ctx, ds, pls, applyPlan, progress)
+			close(progress)
+		}()
+		if subprocess {
+			encoder := gob.NewEncoder(os.Stdout)
+			for status := range progress {
+				if err := encoder.Encode(status); err != nil {
+					log.Error(ctx, "Failed to encode status", err)
+					break
+				}
+			}
+		} else {
+			for range progress {
+				// drain
+			}
+		}
+		if err := <-applyErr; err != nil {
+			log.Warn(ctx, "Plan apply rejected", "plan", applyPlan, "err", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	progress, err := scanner.CallScan(ctx, ds, pls, fullScan, scanTargets)

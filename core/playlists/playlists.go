@@ -47,6 +47,11 @@ type Playlists interface {
 	ImportFromFolder(ctx context.Context, folder *model.Folder, filename string) (*model.Playlist, error)
 	ImportM3U(ctx context.Context, reader io.Reader) (*model.Playlist, error)
 
+	// PreviewFromFolder parses a playlist file without persisting it, so a scan-plan
+	// preview can report whether the file would be newly imported or updated. The
+	// returned playlist has ID set when an existing playlist matches the path.
+	PreviewFromFolder(ctx context.Context, folder *model.Folder, filename string) (*model.Playlist, error)
+
 	// REST adapters
 	NewRepository(ctx context.Context) rest.Repository
 	TracksRepository(ctx context.Context, playlistId string, refreshSmartPlaylist bool) rest.Repository

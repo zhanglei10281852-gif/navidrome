@@ -197,8 +197,12 @@ func pidHashChanged(ds model.DataStore) (bool, error) {
 // runInitialScan runs an initial scan of the music library if needed.
 func runInitialScan(ctx context.Context) func() error {
 	return func() error {
-		ds := CreateDataStore()
-		fullScanRequired, err := ds.Property(ctx).DefaultGet(consts.FullScanAfterMigrationFlagKey, "0")
+			ds := CreateDataStore()
+			// Plans left in running/applying by a previous process crash can never be applied.
+			if n, err := ds.ScanPlan(ctx).FailInterrupted(time.Now()); err == nil && n > 0 {
+				log.Info(ctx, "Marked interrupted scan plans as failed", "count", n)
+			}
+			fullScanRequired, err := ds.Property(ctx).DefaultGet(consts.FullScanAfterMigrationFlagKey, "0")
 		if err != nil {
 			return err
 		}

@@ -33,7 +33,7 @@ func (s *scannerExternal) scanFolders(ctx context.Context, fullScan bool, target
 	s.scan(ctx, fullScan, targets, progress)
 }
 
-func (s *scannerExternal) scan(ctx context.Context, fullScan bool, targets []model.ScanTarget, progress chan<- *ProgressInfo) {
+func (s *scannerExternal) scan(ctx context.Context, fullScan bool, targets []model.ScanTarget, progress chan<- *ProgressInfo, extraArgs ...string) {
 	exe, err := os.Executable()
 	if err != nil {
 		progress <- &ProgressInfo{Error: fmt.Sprintf("failed to get executable path: %s", err)}
@@ -68,6 +68,9 @@ func (s *scannerExternal) scan(ctx context.Context, fullScan bool, targets []mod
 		args = append(args, "--full")
 	}
 
+	// Plan preview/apply hooks (internal flags consumed by cmd/scan.go)
+	args = append(args, extraArgs...)
+
 	cmd := exec.CommandContext(ctx, exe, args...)
 
 	in, out := io.Pipe()
@@ -93,6 +96,17 @@ func (s *scannerExternal) scan(ctx context.Context, fullScan bool, targets []mod
 		}
 		progress <- &p
 	}
+}
+
+// previewFolders runs the read-only preview scan in a subprocess, persisting change
+// items into the plan row the parent already created.
+func (s *scannerExternal) previewFolders(ctx context.Context, fullScan bool, targets []model.ScanTarget, planID string, progress chan<- *ProgressInfo) {
+	s.scan(ctx, fullScan, targets, progress, "--preview-plan", planID)
+}
+
+// applyPlanArgs are the subprocess arguments used when applying a plan externally.
+func applyPlanArgs(planID string) []string {
+	return []string{"--apply-plan", planID}
 }
 
 func (s *scannerExternal) wait(cmd *exec.Cmd, out *io.PipeWriter) {

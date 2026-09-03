@@ -24,14 +24,27 @@ type scannerImpl struct {
 	pls playlists.Playlists
 }
 
+// scanMode selects between a regular applying scan and a read-only plan preview.
+type scanMode int
+
+const (
+	// modeApply is the default: the scan writes changes to the database.
+	modeApply scanMode = iota
+	// modePreview runs the scan as a read-only plan preview, collecting change items instead.
+	modePreview
+)
+
 // scanState holds the state of an in-progress scan, to be passed to the various phases
 type scanState struct {
 	progress          chan<- *ProgressInfo
+	ds                model.DataStore
 	fullScan          bool
-	changesDetected   atomic.Bool
-	libraries         model.Libraries  // Store libraries list for consistency across phases
+	libraries         model.Libraries // Store libraries list for cross-phase consistency
 	targets           map[int][]string // Optional: map[libraryID][]folderPaths for selective scans
 	totalLibraryCount int              // Total number of libraries (unfiltered), for cross-library move detection
+	changesDetected   atomic.Bool
+	mode              scanMode
+	collector         *planCollector
 }
 
 func (s *scanState) sendProgress(info *ProgressInfo) {
@@ -44,8 +57,30 @@ func (s *scanState) isSelectiveScan() bool {
 	return len(s.targets) > 0
 }
 
+func (s *scanState) isPreview() bool {
+	return s.mode == modePreview
+}
+
 func (s *scanState) sendWarning(msg string) {
-	s.sendProgress(&ProgressInfo{Warning: msg})
+	if s.isPreview() && s.collector != nil {
+		s.collector.addWarning(0, msg)
+	}
+	s.sendProgress(&ProgressInfo{Warning: msg, Mode: planProgressMode(s.mode), PlanID: s.planID()})
+}
+
+func (s *scanState) planID() string {
+	if s.collector != nil {
+		return s.collector.planID
+	}
+	return ""
+}
+
+// planProgressMode maps a scan mode to the ProgressInfo.Mode value.
+func planProgressMode(mode scanMode) string {
+	if mode == modePreview {
+		return PlanModePreview
+	}
+	return ""
 }
 
 func (s *scanState) sendError(err error) {
@@ -78,6 +113,7 @@ func (s *scannerImpl) scanFolders(ctx context.Context, fullScan bool, targets []
 
 	state := scanState{
 		progress:        progress,
+		ds:              s.ds,
 		fullScan:        fullScan,
 		changesDetected: atomic.Bool{},
 	}

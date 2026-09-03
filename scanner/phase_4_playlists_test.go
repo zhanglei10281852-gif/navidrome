@@ -242,6 +242,14 @@ func (p *mockPlaylists) ImportFromFolder(ctx context.Context, folder *model.Fold
 	return args.Get(0).(*model.Playlist), args.Error(1)
 }
 
+func (p *mockPlaylists) PreviewFromFolder(ctx context.Context, folder *model.Folder, filename string) (*model.Playlist, error) {
+	args := p.Called(ctx, folder, filename)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*model.Playlist), args.Error(1)
+}
+
 type mockFolderRepository struct {
 	model.FolderRepository
 	data    map[*model.Folder]error

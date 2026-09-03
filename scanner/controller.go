@@ -83,13 +83,27 @@ type ProgressInfo struct {
 	Warning         string
 	Error           string
 	ForceUpdate     bool
+
+	// Plan/progress fields (gob-safe zero values keep the external scanner protocol compatible
+	// with older processes). Mode is empty for regular scans, "preview"/"apply" for scan-plan work.
+	Mode   string // "preview" | "apply" | ""
+	PlanID string
+	Stage  string // human-readable stage label within a preview/apply run
 }
+
+const (
+	PlanModePreview = "preview"
+	PlanModeApply   = "apply"
+)
 
 // scanner defines the interface for different scanner implementations.
 // This allows for swapping between in-process and external scanners.
 type scanner interface {
 	// scanFolders performs the actual scanning of folders. If targets is nil, it scans all libraries.
 	scanFolders(ctx context.Context, fullScan bool, targets []model.ScanTarget, progress chan<- *ProgressInfo)
+	// previewFolders performs a read-only preview scan, persisting change items to the given
+	// scan plan. It never writes media library state; the plan record itself is updated.
+	previewFolders(ctx context.Context, fullScan bool, targets []model.ScanTarget, planID string, progress chan<- *ProgressInfo)
 }
 
 type controller struct {
