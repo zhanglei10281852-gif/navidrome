@@ -485,15 +485,20 @@ type Bookmarks struct {
 }
 
 type Share struct {
-	Entry       []Child    `xml:"entry,omitempty"             json:"entry,omitempty"`
-	ID          string     `xml:"id,attr"                     json:"id"`
-	Url         string     `xml:"url,attr"                    json:"url"`
-	Description string     `xml:"description,omitempty,attr"  json:"description,omitempty"`
-	Username    string     `xml:"username,attr"               json:"username"`
-	Created     time.Time  `xml:"created,attr"                json:"created"`
-	Expires     *time.Time `xml:"expires,omitempty,attr"      json:"expires,omitempty"`
-	LastVisited *time.Time `xml:"lastVisited,omitempty,attr"  json:"lastVisited,omitempty"`
-	VisitCount  int32      `xml:"visitCount,attr"             json:"visitCount"`
+	Entry              []Child    `xml:"entry,omitempty"             json:"entry,omitempty"`
+	ID                 string     `xml:"id,attr"                     json:"id"`
+	Url                string     `xml:"url,attr"                    json:"url"`
+	Description        string     `xml:"description,omitempty,attr"  json:"description,omitempty"`
+	Username           string     `xml:"username,attr"               json:"username"`
+	Created            time.Time  `xml:"created,attr"                json:"created"`
+	Expires            *time.Time `xml:"expires,omitempty,attr"      json:"expires,omitempty"`
+	LastVisited        *time.Time `xml:"lastVisited,omitempty,attr"  json:"lastVisited,omitempty"`
+	VisitCount         int32      `xml:"visitCount,attr"             json:"visitCount"`
+	Epoch              int32      `xml:"epoch,omitempty,attr"        json:"epoch,omitempty"`
+	MaxConcurrentPlays int32      `xml:"maxConcurrentPlays,omitempty,attr" json:"maxConcurrentPlays,omitempty"`
+	ActivePlays        int32      `xml:"activePlays,omitempty,attr"  json:"activePlays,omitempty"`
+	MaxDownloads       int32      `xml:"maxDownloads,omitempty,attr" json:"maxDownloads,omitempty"`
+	DownloadCount      int32      `xml:"downloadCount,omitempty,attr" json:"downloadCount,omitempty"`
 }
 
 type Shares struct {

@@ -17,6 +17,7 @@ vi.mock('../config', () => ({
   shareInfo: {
     id: 'share-1',
     downloadable: true,
+    downloadToken: 'tok-1',
     tracks: [{ id: 't1', title: 'One', artist: 'A', duration: 100 }],
   },
 }))
@@ -59,7 +60,8 @@ describe('SharePlayer', () => {
     })
 
     expect(clickSpy).toHaveBeenCalledTimes(1)
-    expect(anchor.href).toContain('/share/d/share-1')
+    // The href carries the signed download token, not the raw share id.
+    expect(anchor.href).toContain('/share/d/tok-1')
     // Empty, so the server's Content-Disposition filename wins.
     expect(anchor.download).toBe('')
   })

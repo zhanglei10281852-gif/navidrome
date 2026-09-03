@@ -77,7 +77,16 @@ var _ = Describe("Share", func() {
 				entity := &model.Share{}
 				err := repo.Update("id", entity)
 				Expect(err).ToNot(HaveOccurred())
-				Expect(mockedRepo.(*tests.MockShareRepo).Cols).To(ConsistOf("description", "downloadable"))
+				Expect(mockedRepo.(*tests.MockShareRepo).Cols).To(ConsistOf(
+					"description", "downloadable", "max_concurrent_plays", "max_downloads"))
+			})
+
+			It("does not allow clients to write the server-managed columns", func() {
+				entity := &model.Share{Epoch: 9, DownloadCount: 9}
+				err := repo.Update("id", entity)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(mockedRepo.(*tests.MockShareRepo).Cols).ToNot(ContainElement("epoch"))
+				Expect(mockedRepo.(*tests.MockShareRepo).Cols).ToNot(ContainElement("download_count"))
 			})
 		})
 	})

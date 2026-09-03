@@ -22,12 +22,30 @@ type Share struct {
 	Format        string     `structs:"format" json:"format,omitempty"`
 	MaxBitRate    int        `structs:"max_bit_rate" json:"maxBitRate,omitempty"`
 	VisitCount    int        `structs:"visit_count" json:"visitCount,omitempty"`
+	// Epoch is the share's current access generation. Media links (streams,
+	// images, downloads) carry the epoch they were minted for; rotating the
+	// epoch invalidates every link derived from an earlier page. Server-managed:
+	// clients cannot set it through the generic REST API.
+	Epoch int `structs:"epoch" json:"epoch,omitempty"`
+	// MaxConcurrentPlays caps simultaneous public streams (raw or transcoded)
+	// for this share. 0 means unlimited.
+	MaxConcurrentPlays int `structs:"max_concurrent_plays" json:"maxConcurrentPlays,omitempty"`
+	// MaxDownloads is the cumulative number of fully delivered archive
+	// downloads allowed for this share. 0 means unlimited.
+	MaxDownloads int `structs:"max_downloads" json:"maxDownloads,omitempty"`
+	// DownloadCount is the number of archive downloads settled (fully
+	// delivered). Server-managed.
+	DownloadCount int `structs:"download_count" json:"downloadCount,omitempty"`
 	CreatedAt     time.Time  `structs:"created_at" json:"createdAt"`
 	UpdatedAt     time.Time  `structs:"updated_at" json:"updatedAt"`
 	Tracks        MediaFiles `structs:"-" json:"tracks,omitempty"`
 	Albums        Albums     `structs:"-" json:"albums,omitempty"`
-	URL           string     `structs:"-" json:"-"`
-	ImageURL      string     `structs:"-" json:"-"`
+	// ActivePlays is the current in-memory number of active streams for the
+	// share, filled by the share service for owner-facing responses.
+	ActivePlays   int    `structs:"-" json:"activePlays,omitempty"`
+	URL           string `structs:"-" json:"-"`
+	ImageURL      string `structs:"-" json:"-"`
+	DownloadToken string `structs:"-" json:"-"`
 }
 
 func (s Share) CoverArtID() ArtworkID {
@@ -59,4 +77,13 @@ type ShareRepository interface {
 	Get(id string) (*Share, error)
 	GetAll(options ...QueryOptions) (Shares, error)
 	CountAll(options ...QueryOptions) (int64, error)
+	// RotateEpoch atomically increments the share's access generation and
+	// returns the new value. It is ownership-restricted, like Update/Delete.
+	RotateEpoch(id string) (int, error)
+	// SettleDownload atomically increments download_count, but only while the
+	// cumulative budget is not exhausted (max_downloads = 0 means unlimited).
+	// It is intentionally not ownership-restricted: it is called by the
+	// anonymous public download path after a full archive delivery. It reports
+	// whether the row was updated.
+	SettleDownload(id string) (bool, error)
 }

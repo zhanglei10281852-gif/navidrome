@@ -7,6 +7,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/consts"
@@ -21,6 +22,25 @@ import (
 // It creates a signed token for the artwork ID and builds a complete public URL.
 func ImageURL(ctx context.Context, artID model.ArtworkID, size int) string {
 	token, _ := auth.CreatePublicToken(auth.Claims{ID: artID.String()})
+	uri := path.Join(consts.URLPathPublicImages, token)
+	params := url.Values{}
+	if size > 0 {
+		params.Add("size", strconv.Itoa(size))
+	}
+	return PublicURL(ctx, uri, params)
+}
+
+// ShareImageURL generates a public artwork URL bound to a specific share and its
+// current access generation. Unlike ImageURL, the token carries the share ID
+// (sid) and generation (sep), so the image handler can reject links derived
+// from other shares or from an earlier generation. The token expires together
+// with the share (a zero exp means a non-expiring share).
+func ShareImageURL(ctx context.Context, artID model.ArtworkID, size int, shareID string, epoch int, exp time.Time) string {
+	token, _ := auth.CreateExpiringPublicToken(exp, auth.Claims{
+		ID:         artID.String(),
+		ShareID:    shareID,
+		ShareEpoch: epoch,
+	})
 	uri := path.Join(consts.URLPathPublicImages, token)
 	params := url.Values{}
 	if size > 0 {

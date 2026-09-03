@@ -17,13 +17,14 @@ type Claims struct {
 	ExpiresAt time.Time
 
 	// Custom claims
-	UserID  string // "uid"
-	IsAdmin bool   // "adm"
-	ID      string // "id" - artwork/mediafile ID
-	Format  string // "f" - audio format
-	BitRate int    // "b" - audio bitrate
-	ShareID string // "sid" - share ID for share stream tokens
-	Epoch   int    // "ep" - the user's token_epoch at mint time
+	UserID     string // "uid"
+	IsAdmin    bool   // "adm"
+	ID         string // "id" - artwork/mediafile ID
+	Format     string // "f" - audio format
+	BitRate    int    // "b" - audio bitrate
+	ShareID    string // "sid" - share ID for share stream tokens
+	Epoch      int    // "ep" - the user's token_epoch at mint time
+	ShareEpoch int    // "sep" - the share's access generation (epoch) at mint time
 }
 
 // ToMap converts Claims to a map[string]any for use with TokenAuth.Encode().
@@ -66,6 +67,9 @@ func (c Claims) ToMap() map[string]any {
 	if c.Epoch != 0 {
 		m["ep"] = c.Epoch
 	}
+	if c.ShareEpoch != 0 {
+		m["sep"] = c.ShareEpoch
+	}
 	return m
 }
 
@@ -105,6 +109,7 @@ func ClaimsFromToken(token jwt.Token) Claims {
 		c.ShareID = sid
 	}
 	c.Epoch = intClaim(token, "ep")
+	c.ShareEpoch = intClaim(token, "sep")
 	return c
 }
 

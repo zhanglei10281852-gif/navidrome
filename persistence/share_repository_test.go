@@ -571,4 +571,168 @@ var _ = Describe("ShareRepository", func() {
 			})
 		})
 	})
+
+	Describe("Access generation and download budgets", func() {
+		var ownerUser = model.User{ID: "budget-owner", UserName: "budget-owner"}
+		var otherUser = model.User{ID: "budget-other", UserName: "budget-other"}
+
+		insertBudgetShare := func(id string, cols map[string]any) {
+			values := map[string]any{
+				"id":      id,
+				"user":    ownerUser.ID,
+				"desc":    "Budget share",
+				"type":    "media_file",
+				"ids":     "1001",
+				"epoch":   0,
+				"mcp":     0,
+				"md":      0,
+				"dc":      0,
+				"created": time.Now(),
+				"updated": time.Now(),
+			}
+			for k, v := range cols {
+				values[k] = v
+			}
+			_, err := GetDBXBuilder().NewQuery(`
+				INSERT INTO share (id, user_id, description, resource_type, resource_ids,
+				                   epoch, max_concurrent_plays, max_downloads, download_count,
+				                   created_at, updated_at)
+				VALUES ({:id}, {:user}, {:desc}, {:type}, {:ids},
+				        {:epoch}, {:mcp}, {:md}, {:dc}, {:created}, {:updated})
+			`).Bind(map[string]any{
+				"id":      values["id"],
+				"user":    values["user"],
+				"desc":    values["desc"],
+				"type":    values["type"],
+				"ids":     values["ids"],
+				"epoch":   values["epoch"],
+				"mcp":     values["mcp"],
+				"md":      values["md"],
+				"dc":      values["dc"],
+				"created": values["created"],
+				"updated": values["updated"],
+			}).Execute()
+			Expect(err).ToNot(HaveOccurred())
+		}
+
+		BeforeEach(func() {
+			ur := NewUserRepository(ctx, GetDBXBuilder())
+			Expect(ur.Put(&ownerUser)).To(Succeed())
+			Expect(ur.Put(&otherUser)).To(Succeed())
+			_, _ = GetDBXBuilder().NewQuery("DELETE FROM share WHERE id LIKE 'budget-%'").Execute()
+		})
+
+		It("defaults new columns to zero", func() {
+			_, err := GetDBXBuilder().NewQuery(`
+				INSERT INTO share (id, user_id, description, resource_type, resource_ids, created_at, updated_at)
+				VALUES ({:id}, {:user}, {:desc}, {:type}, {:ids}, {:created}, {:updated})
+			`).Bind(map[string]any{
+				"id": "budget-defaults", "user": ownerUser.ID, "desc": "Defaults",
+				"type": "media_file", "ids": "1001", "created": time.Now(), "updated": time.Now(),
+			}).Execute()
+			Expect(err).ToNot(HaveOccurred())
+
+			s, err := repo.Get("budget-defaults")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(s.Epoch).To(Equal(0))
+			Expect(s.MaxConcurrentPlays).To(Equal(0))
+			Expect(s.MaxDownloads).To(Equal(0))
+			Expect(s.DownloadCount).To(Equal(0))
+		})
+
+		It("persists budget fields through the repository", func() {
+			insertBudgetShare("budget-fields", map[string]any{
+				"epoch": 2, "mcp": 3, "md": 5, "dc": 1,
+			})
+			s, err := repo.Get("budget-fields")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(s.Epoch).To(Equal(2))
+			Expect(s.MaxConcurrentPlays).To(Equal(3))
+			Expect(s.MaxDownloads).To(Equal(5))
+			Expect(s.DownloadCount).To(Equal(1))
+		})
+
+		Describe("RotateEpoch", func() {
+			It("atomically increments the epoch for the owner", func() {
+				insertBudgetShare("budget-rotate", map[string]any{"epoch": 0})
+				ownerCtx := request.WithUser(log.NewContext(GinkgoT().Context()), ownerUser)
+				ownerRepo := NewShareRepository(ownerCtx, GetDBXBuilder())
+
+				epoch, err := ownerRepo.RotateEpoch("budget-rotate")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(epoch).To(Equal(1))
+				epoch, err = ownerRepo.RotateEpoch("budget-rotate")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(epoch).To(Equal(2))
+
+				s, err := ownerRepo.Get("budget-rotate")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(s.Epoch).To(Equal(2))
+			})
+
+			It("denies rotation of another user's share", func() {
+				insertBudgetShare("budget-rotate-other", map[string]any{"epoch": 0})
+				otherCtx := request.WithUser(log.NewContext(GinkgoT().Context()), otherUser)
+				otherRepo := NewShareRepository(otherCtx, GetDBXBuilder())
+
+				_, err := otherRepo.RotateEpoch("budget-rotate-other")
+				Expect(err).To(Equal(rest.ErrPermissionDenied))
+
+				s, err := repo.Get("budget-rotate-other")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(s.Epoch).To(Equal(0), "epoch must not change on a denied rotation")
+			})
+
+			It("returns not found for a nonexistent share", func() {
+				_, err := repo.RotateEpoch("budget-does-not-exist")
+				Expect(err).To(Equal(rest.ErrNotFound))
+			})
+		})
+
+		Describe("SettleDownload", func() {
+			It("increments download_count while under the budget", func() {
+				insertBudgetShare("budget-settle", map[string]any{"md": 2, "dc": 0})
+				ok, err := repo.SettleDownload("budget-settle")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(ok).To(BeTrue())
+				ok, err = repo.SettleDownload("budget-settle")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(ok).To(BeTrue())
+
+				s, err := repo.Get("budget-settle")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(s.DownloadCount).To(Equal(2))
+			})
+
+			It("does not increment once the budget is exhausted", func() {
+				insertBudgetShare("budget-exhausted", map[string]any{"md": 1, "dc": 1})
+				ok, err := repo.SettleDownload("budget-exhausted")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(ok).To(BeFalse())
+
+				s, err := repo.Get("budget-exhausted")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(s.DownloadCount).To(Equal(1), "download_count must not exceed max_downloads")
+			})
+
+			It("keeps settling when the budget is unlimited (max_downloads = 0)", func() {
+				insertBudgetShare("budget-unlimited", map[string]any{"md": 0, "dc": 99})
+				ok, err := repo.SettleDownload("budget-unlimited")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(ok).To(BeTrue())
+
+				s, err := repo.Get("budget-unlimited")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(s.DownloadCount).To(Equal(100))
+			})
+
+			It("is not ownership restricted (anonymous settlement)", func() {
+				insertBudgetShare("budget-headless", map[string]any{"md": 1, "dc": 0})
+				headlessRepo := NewShareRepository(GinkgoT().Context(), GetDBXBuilder())
+				ok, err := headlessRepo.SettleDownload("budget-headless")
+				Expect(err).ToNot(HaveOccurred())
+				Expect(ok).To(BeTrue())
+			})
+		})
+	})
 })

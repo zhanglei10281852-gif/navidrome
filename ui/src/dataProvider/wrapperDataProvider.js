@@ -229,6 +229,12 @@ const wrapperDataProvider = {
     httpClient(`${REST_URL}/metadata/${REFRESH_KIND[resource]}/${id}/refresh`, {
       method: 'POST',
     }).then(() => ({ data: { id } })),
+  // Rotates the share's access generation, invalidating every media link
+  // derived from earlier pages. Returns { id, epoch }.
+  rotateShare: (id) =>
+    httpClient(`${REST_URL}/share/${id}/rotate`, {
+      method: 'POST',
+    }).then(({ json }) => ({ data: json })),
 }
 
 export default wrapperDataProvider

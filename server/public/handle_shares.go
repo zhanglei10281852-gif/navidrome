@@ -81,8 +81,10 @@ func checkShareError(ctx context.Context, w http.ResponseWriter, err error, id s
 }
 
 func (pub *Router) mapShareInfo(r *http.Request, s model.Share) *model.Share {
-	s.URL = ShareURL(r.Context(), s.ID)
-	s.ImageURL = publicurl.ImageURL(r.Context(), s.CoverArtID(), conf.Server.UICoverArtSize)
+	ctx := r.Context()
+	s.URL = ShareURL(ctx, s.ID)
+	s.ImageURL = publicurl.ShareImageURL(ctx, s.CoverArtID(), conf.Server.UICoverArtSize, s.ID, s.Epoch, V(s.ExpiresAt))
+	s.DownloadToken = encodeShareToken(s)
 	for i := range s.Tracks {
 		s.Tracks[i].ID = encodeMediafileShare(s, s.Tracks[i].ID)
 	}
@@ -115,11 +117,38 @@ func (pub *Router) mapShareToM3U(r *http.Request, s model.Share) *model.Share {
 // compromise that is out of scope for the share boundary specifically.
 func encodeMediafileShare(s model.Share, id string) string {
 	claims := auth.Claims{
-		ID:      id,
-		Format:  s.Format,
-		BitRate: s.MaxBitRate,
-		ShareID: s.ID,
+		ID:         id,
+		Format:     s.Format,
+		BitRate:    s.MaxBitRate,
+		ShareID:    s.ID,
+		ShareEpoch: s.Epoch,
 	}
 	token, _ := auth.CreateExpiringPublicToken(V(s.ExpiresAt), claims)
 	return token
+}
+
+// encodeShareToken mints a signed capability for share-level actions (currently
+// the archive download) bound to the share's current access generation. It
+// carries no resource id of its own: the handler re-validates the share's
+// existence, expiry, downloadable flag and download budget.
+func encodeShareToken(s model.Share) string {
+	claims := auth.Claims{
+		ShareID:    s.ID,
+		ShareEpoch: s.Epoch,
+	}
+	token, _ := auth.CreateExpiringPublicToken(V(s.ExpiresAt), claims)
+	return token
+}
+
+// decodeShareToken validates a share-level token and returns the share id and
+// the access generation it was minted for.
+func decodeShareToken(tokenString string) (shareID string, epoch int, err error) {
+	c, err := auth.ValidatePublic(tokenString)
+	if err != nil {
+		return "", 0, err
+	}
+	if c.ShareID == "" {
+		return "", 0, errors.New("required claim \"sid\" not found")
+	}
+	return c.ShareID, c.ShareEpoch, nil
 }

@@ -261,11 +261,23 @@
         "visitCount": "Visits",
         "format": "Format",
         "maxBitRate": "Max. Bit Rate",
+        "maxConcurrentPlays": "Max. Concurrent Plays",
+        "maxConcurrentPlaysHint": "Maximum simultaneous listeners (0 = no limit)",
+        "maxDownloads": "Max. Downloads",
+        "maxDownloadsHint": "Total archive downloads allowed (0 = no limit)",
+        "downloadCount": "Downloads (used / limit)",
+        "activePlays": "Listeners (active / limit)",
+        "epoch": "Access Generation",
         "updatedAt": "Updated at",
         "createdAt": "Created at"
       },
-      "notifications": {},
-      "actions": {}
+      "notifications": {
+        "rotated": "Access generation rotated (now %{epoch}). All previously shared links have been invalidated."
+      },
+      "actions": {
+        "rotate": "Rotate Access Generation",
+        "rotateConfirm": "Rotate now? This immediately invalidates every stream, cover and download link already shared. The share link itself stays the same and will serve fresh links."
+      }
     },
     "missing": {
       "name": "Missing File |||| Missing Files",

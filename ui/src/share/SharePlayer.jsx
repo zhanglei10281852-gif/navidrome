@@ -51,10 +51,15 @@ const SharePlayer = () => {
     }
   })
   // An anchor, not a navigation: the service worker's NavigationRoute would
-  // intercept the streamed archive and fail it.
+  // intercept the streamed archive and fail it. The download link is a signed,
+  // generation-bound token delivered with the page, not the share id.
   const customDownloader = useCallback(() => {
+    const token = shareInfo?.downloadToken
+    if (!token) {
+      return
+    }
     const link = document.createElement('a')
-    link.href = shareDownloadUrl(shareInfo?.id)
+    link.href = shareDownloadUrl(token)
     link.download = ''
     document.body.appendChild(link)
     link.click()

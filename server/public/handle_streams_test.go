@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/go-chi/jwtauth/v5"
+	"github.com/navidrome/navidrome/core"
 	"github.com/navidrome/navidrome/core/auth"
 	"github.com/navidrome/navidrome/core/stream"
 	"github.com/navidrome/navidrome/model"
@@ -33,7 +34,7 @@ var _ = Describe("decodeStreamInfo", func() {
 	})
 
 	It("decodes a valid token with all fields", func() {
-		claims := auth.Claims{ID: "mf-123", Format: "mp3", BitRate: 192, ShareID: "share123"}
+		claims := auth.Claims{ID: "mf-123", Format: "mp3", BitRate: 192, ShareID: "share123", ShareEpoch: 2}
 		token, _ := auth.CreateExpiringPublicToken(time.Now().Add(time.Hour), claims)
 		info, err := decodeStreamInfo(token)
 		Expect(err).NotTo(HaveOccurred())
@@ -41,6 +42,7 @@ var _ = Describe("decodeStreamInfo", func() {
 		Expect(info.format).To(Equal("mp3"))
 		Expect(info.bitrate).To(Equal(192))
 		Expect(info.shareID).To(Equal("share123"))
+		Expect(info.epoch).To(Equal(2))
 	})
 
 	It("rejects an expired token", func() {
@@ -104,6 +106,55 @@ var _ = Describe("encodeMediafileShare", func() {
 		Expect(info.shareID).To(Equal("shareXYZ"))
 		Expect(info.id).To(Equal("mf-111"))
 	})
+
+	It("embeds the share's current access generation", func() {
+		s := model.Share{ID: "shareGEN", Epoch: 3}
+		token := encodeMediafileShare(s, "mf-1")
+		info, err := decodeStreamInfo(token)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(info.epoch).To(Equal(3))
+	})
+})
+
+var _ = Describe("share-level tokens", func() {
+	BeforeEach(func() {
+		auth.PublicTokenAuth = jwtauth.New("HS256", []byte("test-secret"), nil)
+	})
+
+	It("round-trips a download token with the share generation", func() {
+		s := model.Share{ID: "shareDL", Epoch: 1, ExpiresAt: new(time.Now().Add(time.Hour))}
+		token := encodeShareToken(s)
+		sid, epoch, err := decodeShareToken(token)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sid).To(Equal("shareDL"))
+		Expect(epoch).To(Equal(1))
+	})
+
+	It("accepts a download token without sep on an unrotated share", func() {
+		s := model.Share{ID: "shareLegacy", Epoch: 0}
+		token := encodeShareToken(s)
+		sid, epoch, err := decodeShareToken(token)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sid).To(Equal("shareLegacy"))
+		Expect(epoch).To(BeZero())
+	})
+
+	It("rejects an expired download token", func() {
+		s := model.Share{ID: "shareDL", ExpiresAt: new(time.Now().Add(-time.Hour))}
+		_, _, err := decodeShareToken(encodeShareToken(s))
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("rejects a token without a share id", func() {
+		token, _ := auth.CreatePublicToken(auth.Claims{ShareEpoch: 1})
+		_, _, err := decodeShareToken(token)
+		Expect(err).To(HaveOccurred())
+	})
+
+	It("rejects a garbage token", func() {
+		_, _, err := decodeShareToken("not-a-jwt")
+		Expect(err).To(HaveOccurred())
+	})
 })
 
 var _ = Describe("handleStream", func() {
@@ -118,7 +169,7 @@ var _ = Describe("handleStream", func() {
 		shareRepo = &tests.MockShareRepo{}
 		ds.MockedShare = shareRepo
 		streamer = &mockStreamer{}
-		pub = &Router{ds: ds, streamer: streamer}
+		pub = &Router{ds: ds, streamer: streamer, share: core.NewShare(ds)}
 	})
 
 	makeRequest := func(token string) *httptest.ResponseRecorder {
@@ -244,5 +295,73 @@ var _ = Describe("handleStream", func() {
 	It("returns 400 for an invalid token", func() {
 		w := makeRequest("not-a-valid-token")
 		Expect(w.Code).To(Equal(http.StatusBadRequest))
+	})
+
+	It("returns 410 for a token from a previous generation", func() {
+		shareOwnedBy(
+			model.User{ID: "owner1", UserName: "owner1", IsAdmin: true},
+			model.MediaFile{ID: "mf-123", Title: "Test Song"},
+		)
+		// Share was rotated: current generation is 1, token carries none (0).
+		shareRepo.Entity.(*model.Share).Epoch = 1
+
+		claims := auth.Claims{ID: "mf-123", ShareID: "share123"}
+		token, _ := auth.CreateExpiringPublicToken(time.Now().Add(time.Hour), claims)
+		w := makeRequest(token)
+
+		Expect(w.Code).To(Equal(http.StatusGone))
+		Expect(streamer.called).To(BeFalse())
+	})
+
+	It("accepts a token matching the current generation", func() {
+		shareOwnedBy(
+			model.User{ID: "owner1", UserName: "owner1", IsAdmin: true},
+			model.MediaFile{ID: "mf-123", Title: "Test Song"},
+		)
+		shareRepo.Entity.(*model.Share).Epoch = 2
+
+		claims := auth.Claims{ID: "mf-123", ShareID: "share123", ShareEpoch: 2}
+		token, _ := auth.CreateExpiringPublicToken(time.Now().Add(time.Hour), claims)
+		makeRequest(token)
+
+		Expect(streamer.called).To(BeTrue())
+	})
+
+	It("returns 429 without streaming when the play budget is full", func() {
+		shareOwnedBy(
+			model.User{ID: "owner1", UserName: "owner1", IsAdmin: true},
+			model.MediaFile{ID: "mf-123", Title: "Test Song"},
+		)
+		sh := shareRepo.Entity.(*model.Share)
+		sh.MaxConcurrentPlays = 1
+		// Hold the only slot from outside the handler.
+		_, hold, err := pub.share.AcquirePlay(context.Background(), sh)
+		Expect(err).ToNot(HaveOccurred())
+		defer hold()
+
+		claims := auth.Claims{ID: "mf-123", ShareID: "share123"}
+		token, _ := auth.CreateExpiringPublicToken(time.Now().Add(time.Hour), claims)
+		w := makeRequest(token)
+
+		Expect(w.Code).To(Equal(http.StatusTooManyRequests))
+		Expect(w.Header().Get("Retry-After")).To(Equal("5"))
+		Expect(streamer.called).To(BeFalse())
+	})
+
+	It("releases the play slot so a later request is admitted again", func() {
+		shareOwnedBy(
+			model.User{ID: "owner1", UserName: "owner1", IsAdmin: true},
+			model.MediaFile{ID: "mf-123", Title: "Test Song"},
+		)
+		sh := shareRepo.Entity.(*model.Share)
+		sh.MaxConcurrentPlays = 1
+
+		claims := auth.Claims{ID: "mf-123", ShareID: "share123"}
+		token, _ := auth.CreateExpiringPublicToken(time.Now().Add(time.Hour), claims)
+		// The mock streamer fails to start; the deferred release must still free
+		// the slot, so the play count must return to zero.
+		makeRequest(token)
+		Expect(streamer.called).To(BeTrue())
+		Expect(pub.share.ActivePlays("share123")).To(BeZero())
 	})
 })

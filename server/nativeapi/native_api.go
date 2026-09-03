@@ -3,6 +3,7 @@ package nativeapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"html"
 	"net/http"
 	"strconv"
@@ -78,7 +79,7 @@ func (api *Router) routes() http.Handler {
 		api.R(r, "/tag", model.Tag{}, false)
 		api.R(r, "/scrobble", model.Scrobble{}, false)
 		if conf.Server.EnableSharing {
-			api.RX(r, "/share", api.share.NewRepository, true)
+			api.addShareRoute(r)
 		}
 
 		api.addPlaylistRoute(r)
@@ -100,6 +101,49 @@ func (api *Router) routes() http.Handler {
 	})
 
 	return r
+}
+
+// addShareRoute registers the generic CRUD repository for shares plus the
+// generation-rotation action. Rotation is a server-side action (it bumps the
+// access generation and revokes in-flight links), so it is not exposed through
+// the generic PUT: clients call POST /share/{id}/rotate and receive the new
+// epoch. Ownership is enforced by the repository's owner restriction.
+func (api *Router) addShareRoute(r chi.Router) {
+	constructor := func(ctx context.Context) rest.Repository {
+		return api.share.NewRepository(ctx)
+	}
+	r.Route("/share", func(r chi.Router) {
+		r.Get("/", rest.GetAll(constructor))
+		r.Post("/", rest.Post(constructor))
+		r.Route("/{id}", func(r chi.Router) {
+			r.Use(server.URLParamsMiddleware)
+			r.Get("/", rest.Get(constructor))
+			r.Put("/", rest.Put(constructor))
+			r.Delete("/", rest.Delete(constructor))
+			r.Post("/rotate", rotateShare(api.share))
+		})
+	})
+}
+
+func rotateShare(share core.Share) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		id := chi.URLParam(r, "id")
+		epoch, err := share.Rotate(r.Context(), id)
+		if err != nil {
+			log.Error(r.Context(), "Error rotating share generation", "id", id, err)
+			switch {
+			case errors.Is(err, rest.ErrPermissionDenied):
+				http.Error(w, "Access denied", http.StatusForbidden)
+			case errors.Is(err, rest.ErrNotFound):
+				http.Error(w, "Share not found", http.StatusNotFound)
+			default:
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"id": id, "epoch": epoch})
+	}
 }
 
 func (api *Router) R(r chi.Router, pathPrefix string, model any, persistable bool) {

@@ -30,14 +30,19 @@ func (api *Router) GetShares(r *http.Request) (*responses.Subsonic, error) {
 
 func (api *Router) buildShare(r *http.Request, share model.Share) responses.Share {
 	resp := responses.Share{
-		ID:          share.ID,
-		Url:         public.ShareURL(r.Context(), share.ID),
-		Description: share.Description,
-		Username:    share.Username,
-		Created:     share.CreatedAt,
-		Expires:     share.ExpiresAt,
-		LastVisited: share.LastVisitedAt,
-		VisitCount:  int32(share.VisitCount),
+		ID:                 share.ID,
+		Url:                public.ShareURL(r.Context(), share.ID),
+		Description:        share.Description,
+		Username:           share.Username,
+		Created:            share.CreatedAt,
+		Expires:            share.ExpiresAt,
+		LastVisited:        share.LastVisitedAt,
+		VisitCount:         int32(share.VisitCount),
+		Epoch:              int32(share.Epoch),
+		MaxConcurrentPlays: int32(share.MaxConcurrentPlays),
+		ActivePlays:        int32(share.ActivePlays),
+		MaxDownloads:       int32(share.MaxDownloads),
+		DownloadCount:      int32(share.DownloadCount),
 	}
 	if resp.Description == "" {
 		resp.Description = share.Contents
@@ -60,9 +65,11 @@ func (api *Router) CreateShare(r *http.Request) (*responses.Subsonic, error) {
 	description, _ := p.String("description")
 	repo := api.share.NewRepository(r.Context())
 	share := &model.Share{
-		Description: description,
-		ExpiresAt:   new(p.TimeOr("expires", time.Time{})),
-		ResourceIDs: strings.Join(ids, ","),
+		ResourceIDs:        strings.Join(ids, ","),
+		Description:        description,
+		ExpiresAt:          new(p.TimeOr("expires", time.Time{})),
+		MaxConcurrentPlays: p.IntOr("maxConcurrentPlays", 0),
+		MaxDownloads:       p.IntOr("maxDownloads", 0),
 	}
 
 	id, err := repo.(rest.Persistable).Save(share)
@@ -87,16 +94,38 @@ func (api *Router) UpdateShare(r *http.Request) (*responses.Subsonic, error) {
 		return nil, err
 	}
 
-	description, _ := p.String("description")
 	repo := api.share.NewRepository(r.Context())
+
+	// Rotate first, so a rotate=true request also revokes every link derived
+	// before the following field updates.
+	if p.BoolOr("rotate", false) {
+		if _, err := api.share.Rotate(r.Context(), id); err != nil {
+			return nil, err
+		}
+	}
+
+	description, _ := p.String("description")
 	share := &model.Share{
 		ID:          id,
 		Description: description,
 		ExpiresAt:   new(p.TimeOr("expires", time.Time{})),
 	}
 
-	err = repo.(rest.Persistable).Update(id, share)
-	if err != nil {
+	// Budget columns are always written by the repository wrapper, so default
+	// them to the stored values and only override what the request explicitly
+	// provides (absent params must not reset limits to unlimited).
+	if existing, gErr := repo.(model.ShareRepository).Get(id); gErr == nil {
+		share.MaxConcurrentPlays = existing.MaxConcurrentPlays
+		share.MaxDownloads = existing.MaxDownloads
+	}
+	if _, ok := r.URL.Query()["maxConcurrentPlays"]; ok {
+		share.MaxConcurrentPlays = p.IntOr("maxConcurrentPlays", 0)
+	}
+	if _, ok := r.URL.Query()["maxDownloads"]; ok {
+		share.MaxDownloads = p.IntOr("maxDownloads", 0)
+	}
+
+	if err = repo.(rest.Persistable).Update(id, share); err != nil {
 		return nil, err
 	}
 

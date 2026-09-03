@@ -59,6 +59,12 @@ var _ = Describe("Claims", func() {
 			m := c.ToMap()
 			Expect(m).To(HaveKeyWithValue("sid", "abc1234567"))
 		})
+
+		It("includes the share generation claim only when non-zero", func() {
+			Expect(auth.Claims{ShareID: "s1"}.ToMap()).ToNot(HaveKey("sep"))
+			m := auth.Claims{ShareID: "s1", ShareEpoch: 2}.ToMap()
+			Expect(m).To(HaveKeyWithValue("sep", 2))
+		})
 	})
 
 	Describe("ClaimsFromToken", func() {
@@ -87,11 +93,12 @@ var _ = Describe("Claims", func() {
 		It("round-trips public token claims through encode/decode", func() {
 			tokenAuth := jwtauth.New("HS256", []byte("test-secret"), nil)
 			original := auth.Claims{
-				Issuer:  "ND",
-				ID:      "al-456",
-				Format:  "opus",
-				BitRate: 128,
-				ShareID: "abc1234567",
+				Issuer:     "ND",
+				ID:         "al-456",
+				Format:     "opus",
+				BitRate:    128,
+				ShareID:    "abc1234567",
+				ShareEpoch: 3,
 			}
 			token, _, err := tokenAuth.Encode(original.ToMap())
 			Expect(err).NotTo(HaveOccurred())
@@ -102,6 +109,7 @@ var _ = Describe("Claims", func() {
 			Expect(c.ShareID).To(Equal("abc1234567"))
 			Expect(c.Format).To(Equal("opus"))
 			Expect(c.BitRate).To(Equal(128))
+			Expect(c.ShareEpoch).To(Equal(3))
 		})
 	})
 

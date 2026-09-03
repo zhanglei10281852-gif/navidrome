@@ -3,7 +3,9 @@ package publicurl_test
 import (
 	"context"
 	"net/url"
+	"path"
 	"testing"
+	"time"
 
 	"github.com/go-chi/jwtauth/v5"
 	"github.com/navidrome/navidrome/conf"
@@ -227,6 +229,51 @@ var _ = Describe("Public URL Utilities", func() {
 			conf.Server.Port = 4533
 			result := publicurl.ImageURL(context.Background(), artID, 0)
 			Expect(result).To(HavePrefix("http://localhost:4533/share/img/"))
+		})
+	})
+
+	Describe("ShareImageURL", func() {
+		BeforeEach(func() {
+			conf.Server.ShareURL = "https://share.example.com"
+			auth.PublicTokenAuth = jwtauth.New("HS256", []byte("test secret"), nil)
+		})
+
+		decode := func(u string) auth.Claims {
+			parsed, err := url.Parse(u)
+			Expect(err).ToNot(HaveOccurred())
+			// path: /share/img/<token>
+			token := path.Base(parsed.Path)
+			claims, err := auth.ValidatePublic(token)
+			Expect(err).ToNot(HaveOccurred())
+			return claims
+		}
+
+		It("generates a URL with the share-bound token", func() {
+			artID := model.NewArtworkID(model.KindAlbumArtwork, "album-123", nil)
+			result := publicurl.ShareImageURL(context.Background(), artID, 300, "share-xyz", 2, time.Time{})
+			Expect(result).To(HavePrefix("https://share.example.com/share/img/"))
+			Expect(result).To(ContainSubstring("size=300"))
+
+			claims := decode(result)
+			Expect(claims.ID).To(Equal(artID.String()))
+			Expect(claims.ShareID).To(Equal("share-xyz"))
+			Expect(claims.ShareEpoch).To(Equal(2))
+		})
+
+		It("expires together with the share", func() {
+			artID := model.NewArtworkID(model.KindAlbumArtwork, "album-123", nil)
+			result := publicurl.ShareImageURL(context.Background(), artID, 0, "share-xyz", 1, time.Now().Add(time.Hour))
+			claims := decode(result)
+			Expect(claims.ExpiresAt).To(BeTemporally("~", time.Now().Add(time.Hour), time.Minute))
+		})
+
+		It("produces a different token than a non-share image URL", func() {
+			artID := model.NewArtworkID(model.KindMediaFileArtwork, "track-1", nil)
+			plain := publicurl.ImageURL(context.Background(), artID, 0)
+			Expect(decode(plain).ShareID).To(BeEmpty())
+
+			bound := publicurl.ShareImageURL(context.Background(), artID, 0, "share-1", 0, time.Time{})
+			Expect(bound).ToNot(Equal(plain))
 		})
 	})
 })

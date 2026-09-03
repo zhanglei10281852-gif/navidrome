@@ -33,11 +33,33 @@ func (pub *Router) handleImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	artId, err := decodeArtworkID(id)
+	artId, claims, err := decodeArtworkID(id)
 	if err != nil {
 		log.Error(r, "Error decoding artwork id", "id", id, err)
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
+	}
+	// Share-bound artwork tokens must reference a live share at the exact
+	// generation they were minted for. Rotating the share invalidates cover
+	// links derived from earlier pages, just like streams and downloads.
+	// Tokens without a share claim (Subsonic image links, plugins) keep the
+	// legacy token-as-authorization behavior.
+	if claims.ShareID != "" {
+		share, err := pub.ds.Share(ctx).Get(claims.ShareID)
+		if err != nil {
+			checkShareError(ctx, w, err, claims.ShareID)
+			return
+		}
+		if expiresAt := share.ExpiresAt; expiresAt != nil && expiresAt.Before(time.Now()) {
+			checkShareError(ctx, w, model.ErrExpired, claims.ShareID)
+			return
+		}
+		if claims.ShareEpoch != share.Epoch {
+			log.Warn(ctx, "Rejecting shared artwork from a previous generation",
+				"share", claims.ShareID, "tokenEpoch", claims.ShareEpoch, "currentEpoch", share.Epoch)
+			http.Error(w, "Share not available anymore", http.StatusGone)
+			return
+		}
 	}
 	// The token is the authorization, so the entity check must ask "is it still there", not
 	// "may this user see it" -- the latter would hide a shared private playlist.
@@ -73,22 +95,23 @@ func (pub *Router) handleImages(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func decodeArtworkID(tokenString string) (model.ArtworkID, error) {
+func decodeArtworkID(tokenString string) (model.ArtworkID, auth.Claims, error) {
 	token, err := auth.PublicTokenAuth.Decode(tokenString)
 	if err != nil {
-		return model.ArtworkID{}, err
+		return model.ArtworkID{}, auth.Claims{}, err
 	}
 	if token == nil {
-		return model.ArtworkID{}, errors.New("unauthorized")
+		return model.ArtworkID{}, auth.Claims{}, errors.New("unauthorized")
 	}
 	c := auth.ClaimsFromToken(token)
 	if c.ID == "" {
-		return model.ArtworkID{}, errors.New("required claim \"id\" not found")
+		return model.ArtworkID{}, auth.Claims{}, errors.New("required claim \"id\" not found")
 	}
 	artID, err := model.ParseArtworkID(c.ID)
 	if err == nil {
-		return artID, nil
+		return artID, c, nil
 	}
 	// Try to default to mediafile artworkId (if used with a mediafileShare token)
-	return model.ParseArtworkID("mf-" + c.ID)
+	artID, err = model.ParseArtworkID("mf-" + c.ID)
+	return artID, c, err
 }

@@ -193,6 +193,49 @@ func (r *shareRepository) CountAll(options ...model.QueryOptions) (int64, error)
 	return r.count(r.selectShare(), options...)
 }
 
+// RotateEpoch atomically bumps the share's access generation. Like updateOwned,
+// the WHERE clause carries the ownership restriction, so a share owned by
+// another user simply does not match. The freshly stored epoch is read back and
+// returned.
+func (r *shareRepository) RotateEpoch(id string) (int, error) {
+	update := Update(r.tableName).
+		Where(r.addRestriction(Eq{"id": id})).
+		SetMap(map[string]any{
+			"epoch":      Expr("epoch + 1"),
+			"updated_at": time.Now(),
+		})
+	count, err := r.executeSQL(update)
+	if err != nil {
+		return 0, err
+	}
+	if count == 0 {
+		return 0, r.classifyOwnedWriteMiss(id)
+	}
+
+	var res struct{ Epoch int }
+	if err := r.queryOne(r.newSelect().Columns("epoch").Where(Eq{"id": id}), &res); err != nil {
+		return 0, err
+	}
+	return res.Epoch, nil
+}
+
+// SettleDownload records one fully delivered archive download. The conditional
+// WHERE clause makes the increment a no-op once the cumulative budget is
+// exhausted, so racing settlements can never push download_count past
+// max_downloads. It is deliberately not ownership-restricted: the caller is the
+// anonymous public download path.
+func (r *shareRepository) SettleDownload(id string) (bool, error) {
+	update := Update(r.tableName).
+		Where(Eq{"id": id}).
+		Where("(max_downloads = 0 OR download_count < max_downloads)").
+		Set("download_count", Expr("download_count + 1"))
+	count, err := r.executeSQL(update)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
 func (r *shareRepository) Count(options ...rest.QueryOptions) (int64, error) {
 	return r.CountAll(r.parseRestOptions(r.ctx, options...))
 }

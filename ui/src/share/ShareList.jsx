@@ -106,6 +106,26 @@ const ShareList = (props) => {
           {isDesktop && <TextField source="contents" />}
           {isDesktop && <FormatInfo source="format" />}
           {config.enableDownloads && <BooleanField source="downloadable" />}
+          {isDesktop && (
+            <FunctionField
+              source="activePlays"
+              render={(r) =>
+                `${r.activePlays ?? 0} / ${
+                  r.maxConcurrentPlays > 0 ? r.maxConcurrentPlays : '∞'
+                }`
+              }
+            />
+          )}
+          {config.enableDownloads && isDesktop && (
+            <FunctionField
+              source="downloadCount"
+              render={(r) =>
+                `${r.downloadCount ?? 0} / ${
+                  r.maxDownloads > 0 ? r.maxDownloads : '∞'
+                }`
+              }
+            />
+          )}
           <NumberField source="visitCount" />
           {isDesktop && (
             <DateField source="lastVisitedAt" showTime sortByOrder={'DESC'} />

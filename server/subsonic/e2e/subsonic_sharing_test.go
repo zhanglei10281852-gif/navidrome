@@ -205,3 +205,61 @@ var _ = Describe("Sharing Cross-User Isolation", Ordered, func() {
 		Expect(check.Shares.Share[0].ID).To(Equal(shareID))
 	})
 })
+
+var _ = Describe("Share Budgets and Generations", Ordered, func() {
+	var shareID string
+	var albumID string
+
+	BeforeAll(func() {
+		conf.Server.EnableSharing = true
+		setupTestDB()
+
+		albums, err := ds.Album(ctx).GetAll(model.QueryOptions{Filters: squirrel.Eq{"album.name": "Abbey Road"}})
+		Expect(err).ToNot(HaveOccurred())
+		Expect(albums).ToNot(BeEmpty())
+		albumID = albums[0].ID
+	})
+
+	It("createShare persists the playback and download budgets", func() {
+		resp := doReq("createShare", "id", albumID, "description", "Budgeted",
+			"maxConcurrentPlays", "2", "maxDownloads", "5")
+		Expect(resp.Status).To(Equal(responses.StatusOK))
+		Expect(resp.Shares.Share).To(HaveLen(1))
+		share := resp.Shares.Share[0]
+		shareID = share.ID
+		Expect(share.MaxConcurrentPlays).To(Equal(int32(2)))
+		Expect(share.MaxDownloads).To(Equal(int32(5)))
+		Expect(share.DownloadCount).To(BeZero())
+		Expect(share.Epoch).To(BeZero())
+	})
+
+	It("updates the budgets and preserves them when other params change", func() {
+		resp := doReq("updateShare", "id", shareID, "maxConcurrentPlays", "4")
+		Expect(resp.Status).To(Equal(responses.StatusOK))
+
+		resp = doReq("updateShare", "id", shareID, "description", "Touched only")
+		Expect(resp.Status).To(Equal(responses.StatusOK))
+
+		shares := doReq("getShares").Shares.Share
+		Expect(shares).To(HaveLen(1))
+		Expect(shares[0].MaxConcurrentPlays).To(Equal(int32(4)), "updated play budget persists")
+		Expect(shares[0].MaxDownloads).To(Equal(int32(5)), "unset budget is not reset")
+	})
+
+	It("rotates the access generation via updateShare rotate=true", func() {
+		resp := doReq("updateShare", "id", shareID, "rotate", "true")
+		Expect(resp.Status).To(Equal(responses.StatusOK))
+
+		shares := doReq("getShares").Shares.Share
+		Expect(shares).To(HaveLen(1))
+		Expect(shares[0].Epoch).To(Equal(int32(1)))
+	})
+
+	It("reports usage attributes on getShares", func() {
+		shares := doReq("getShares").Shares.Share
+		Expect(shares).To(HaveLen(1))
+		Expect(shares[0].Epoch).To(Equal(int32(1)))
+		Expect(shares[0].MaxConcurrentPlays).To(BeNumerically(">", 0))
+		Expect(shares[0].MaxDownloads).To(BeNumerically(">", 0))
+	})
+})

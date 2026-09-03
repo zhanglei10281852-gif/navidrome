@@ -1,12 +1,15 @@
 package public
 
 import (
+	"context"
 	"errors"
+	"io"
 	"net/http"
 	"slices"
 	"strconv"
 	"time"
 
+	"github.com/navidrome/navidrome/core"
 	"github.com/navidrome/navidrome/core/auth"
 	streampkg "github.com/navidrome/navidrome/core/stream"
 	"github.com/navidrome/navidrome/log"
@@ -35,6 +38,15 @@ func (pub *Router) handleStream(w http.ResponseWriter, r *http.Request) {
 		checkShareError(ctx, w, model.ErrExpired, info.shareID)
 		return
 	}
+	// The link must belong to the share's current access generation. Tokens
+	// minted before a rotation carry a stale generation and are rejected even
+	// though their signature is valid.
+	if info.epoch != share.Epoch {
+		log.Warn(ctx, "Rejecting shared stream from a previous generation",
+			"share", info.shareID, "tokenEpoch", info.epoch, "currentEpoch", share.Epoch)
+		http.Error(w, "Share not available anymore", http.StatusGone)
+		return
+	}
 	shareOwner, err := pub.ds.User(ctx).Get(share.UserID)
 	if err != nil {
 		log.Error(ctx, "Error retrieving share owner for shared stream", "share", info.shareID, "owner", share.UserID, err)
@@ -60,7 +72,24 @@ func (pub *Router) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	stream, err := pub.streamer.NewStream(ctx, mf, streampkg.Request{
+	// Reserve a concurrent-play slot for this share. This covers raw and
+	// transcoded streams alike; the slot is released on every exit path
+	// (normal end, client disconnect, startup failure) and is tied to a context
+	// that rotation cancels to cut in-flight streams immediately.
+	playCtx, release, err := pub.share.AcquirePlay(ctx, share)
+	if err != nil {
+		if errors.Is(err, core.ErrSharePlayLimit) {
+			w.Header().Set("Retry-After", strconv.Itoa(playRetryAfterSeconds))
+			http.Error(w, "too many concurrent listeners for this share, please retry shortly", http.StatusTooManyRequests)
+			return
+		}
+		log.Error(ctx, "Error acquiring shared play slot", "share", info.shareID, err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	defer release()
+
+	stream, err := pub.streamer.NewStream(playCtx, mf, streampkg.Request{
 		Format: info.format, BitRate: info.bitrate,
 	})
 	if err != nil {
@@ -73,6 +102,9 @@ func (pub *Router) handleStream(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "invalid request", http.StatusInternalServerError)
 		return
 	}
+	// Abort reads promptly when rotation cancels playCtx (raw streams otherwise
+	// only notice a client disconnect, not a server-side revocation).
+	stream.ReadCloser = &playCtxReader{ReadCloser: stream.ReadCloser, ctx: playCtx}
 
 	// Make sure the stream will be closed at the end, to avoid leakage
 	defer func() {
@@ -84,10 +116,29 @@ func (pub *Router) handleStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("X-Content-Duration", strconv.FormatFloat(float64(stream.Duration()), 'G', -1, 32))
 
-	n, err := stream.Serve(ctx, w, r)
+	n, err := stream.Serve(playCtx, w, r)
 	if err != nil || n == 0 {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 	}
+}
+
+// playRetryAfterSeconds mirrors the transcode limiter's hint: listeners that
+// hit the per-share play cap are told to back off briefly.
+const playRetryAfterSeconds = 5
+
+// playCtxReader wraps a stream so reads fail as soon as the play context is
+// canceled (client disconnect or share generation rotation), aborting even
+// raw (non-transcoded) streams instead of draining to the end.
+type playCtxReader struct {
+	io.ReadCloser
+	ctx context.Context
+}
+
+func (r *playCtxReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.ReadCloser.Read(p)
 }
 
 type shareTrackInfo struct {
@@ -95,6 +146,7 @@ type shareTrackInfo struct {
 	format  string
 	bitrate int
 	shareID string
+	epoch   int
 }
 
 func shareContainsTrack(share *model.Share, mediaFileID string) bool {
@@ -122,5 +174,6 @@ func decodeStreamInfo(tokenString string) (shareTrackInfo, error) {
 		format:  c.Format,
 		bitrate: c.BitRate,
 		shareID: c.ShareID,
+		epoch:   c.ShareEpoch,
 	}, nil
 }

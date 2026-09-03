@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Masterminds/squirrel"
@@ -19,16 +20,32 @@ import (
 type Share interface {
 	Load(ctx context.Context, id string) (*model.Share, error)
 	NewRepository(ctx context.Context) rest.Repository
+	// Rotate bumps the share's access generation and revokes all in-flight
+	// plays and downloads derived from earlier generations.
+	Rotate(ctx context.Context, id string) (int, error)
+	// AcquirePlay reserves one concurrent-play slot. The returned context is
+	// canceled when the slot is released or the share is rotated; the release
+	// function must be called exactly once when the request ends.
+	AcquirePlay(ctx context.Context, s *model.Share) (context.Context, context.CancelFunc, error)
+	// ReserveDownload reserves one cumulative-download slot. The lease's
+	// Commit is called only after a full archive delivery, Release on every
+	// other outcome; the two share a single idempotent guard.
+	ReserveDownload(ctx context.Context, s *model.Share) (*DownloadLease, error)
+	// ActivePlays reports the number of streams currently playing for a share.
+	ActivePlays(shareID string) int
 }
 
 func NewShare(ds model.DataStore) Share {
 	return &shareService{
-		ds: ds,
+		ds:      ds,
+		budgets: map[string]*shareBudget{},
 	}
 }
 
 type shareService struct {
-	ds model.DataStore
+	ds        model.DataStore
+	budgetsMu sync.Mutex
+	budgets   map[string]*shareBudget
 }
 
 func (s *shareService) Load(ctx context.Context, id string) (*model.Share, error) {
@@ -54,11 +71,12 @@ func (s *shareService) Load(ctx context.Context, id string) (*model.Share, error
 func (s *shareService) NewRepository(ctx context.Context) rest.Repository {
 	repo := s.ds.Share(ctx)
 	wrapper := &shareRepositoryWrapper{
-		ctx:             ctx,
 		ShareRepository: repo,
 		Repository:      repo.(rest.Repository),
 		Persistable:     repo.(rest.Persistable),
+		ctx:             ctx,
 		ds:              s.ds,
+		activePlays:     s.ActivePlays,
 	}
 	return wrapper
 }
@@ -67,8 +85,31 @@ type shareRepositoryWrapper struct {
 	model.ShareRepository
 	rest.Repository
 	rest.Persistable
-	ctx context.Context
-	ds  model.DataStore
+	ctx         context.Context
+	ds          model.DataStore
+	activePlays func(shareID string) int
+}
+
+// Get/GetAll enrich the persisted shares with the live number of active
+// streams, so owner-facing UIs/APIs can show current usage.
+func (r *shareRepositoryWrapper) Get(id string) (*model.Share, error) {
+	sh, err := r.ShareRepository.Get(id)
+	if err != nil {
+		return nil, err
+	}
+	sh.ActivePlays = r.activePlays(id)
+	return sh, nil
+}
+
+func (r *shareRepositoryWrapper) GetAll(options ...model.QueryOptions) (model.Shares, error) {
+	shares, err := r.ShareRepository.GetAll(options...)
+	if err != nil {
+		return nil, err
+	}
+	for i := range shares {
+		shares[i].ActivePlays = r.activePlays(shares[i].ID)
+	}
+	return shares, nil
 }
 
 func (r *shareRepositoryWrapper) newId() (string, error) {
@@ -127,7 +168,9 @@ func (r *shareRepositoryWrapper) Save(entity any) (string, error) {
 }
 
 func (r *shareRepositoryWrapper) Update(id string, entity any, _ ...string) error {
-	cols := []string{"description", "downloadable"}
+	// Epoch and download_count are intentionally not writable here: they are
+	// server-managed through Rotate and the download settlement path.
+	cols := []string{"description", "downloadable", "max_concurrent_plays", "max_downloads"}
 
 	// TODO Better handling of Share expiration
 	if !V(entity.(*model.Share).ExpiresAt).IsZero() {

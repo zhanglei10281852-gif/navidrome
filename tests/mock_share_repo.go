@@ -14,6 +14,14 @@ type MockShareRepo struct {
 	ID     string
 	Cols   []string
 	Error  error
+
+	Epoch            int
+	RotateCalled     bool
+	RotateError      error
+	SettleMiss       bool
+	SettleError      error
+	SettleCalledWith string
+	SettleCallCount  int
 }
 
 func (m *MockShareRepo) Save(entity any) (string, error) {
@@ -56,4 +64,31 @@ func (m *MockShareRepo) Get(id string) (*model.Share, error) {
 		return s, nil
 	}
 	return &model.Share{ID: id}, nil
+}
+
+func (m *MockShareRepo) RotateEpoch(id string) (int, error) {
+	m.RotateCalled = true
+	if m.RotateError != nil {
+		return 0, m.RotateError
+	}
+	m.Epoch++
+	if s, ok := m.Entity.(*model.Share); ok {
+		s.Epoch = m.Epoch
+	}
+	return m.Epoch, nil
+}
+
+func (m *MockShareRepo) SettleDownload(id string) (bool, error) {
+	m.SettleCallCount++
+	m.SettleCalledWith = id
+	if m.SettleError != nil {
+		return false, m.SettleError
+	}
+	if m.SettleMiss {
+		return false, nil
+	}
+	if s, ok := m.Entity.(*model.Share); ok {
+		s.DownloadCount++
+	}
+	return true, nil
 }
