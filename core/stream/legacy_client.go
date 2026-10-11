@@ -129,6 +129,9 @@ func (s *deciderService) resolve(ctx context.Context, mf *model.MediaFile, clien
 		req.SampleRate = decision.TargetSampleRate
 		req.BitDepth = decision.TargetBitDepth
 		req.Channels = decision.TargetChannels
+		// Pin the whole playback (command lookup and cache namespace) to the
+		// snapshot the decision was taken against.
+		req.Generation = decision.TargetGeneration
 	default:
 		return req, false
 	}

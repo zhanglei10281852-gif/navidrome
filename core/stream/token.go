@@ -24,6 +24,7 @@ type params struct {
 	TargetChannels   int
 	TargetSampleRate int
 	TargetBitDepth   int
+	TargetGeneration string
 	SourceUpdatedAt  time.Time
 }
 
@@ -51,6 +52,12 @@ func (d *TranscodeDecision) toClaimsMap() map[string]any {
 		}
 		if d.TargetBitDepth != 0 {
 			m["bd"] = d.TargetBitDepth
+		}
+		// The generation is part of the signed snapshot: a later stream
+		// request must run the exact committed configuration the decision was
+		// taken against, not whatever an admin changed in the meantime.
+		if d.TargetGeneration != "" {
+			m["g"] = d.TargetGeneration
 		}
 	}
 	return m
@@ -84,6 +91,10 @@ func paramsFromToken(token jwt.Token) (*params, error) {
 	var f string
 	if err := token.Get("f", &f); err == nil {
 		p.TargetFormat = f
+	}
+	var g string
+	if err := token.Get("g", &g); err == nil {
+		p.TargetGeneration = g
 	}
 	p.TargetBitrate = getIntClaim(token, "b")
 	p.TargetChannels = getIntClaim(token, "ch")
@@ -131,11 +142,27 @@ func (s *deciderService) ResolveRequestFromToken(ctx context.Context, token stri
 
 	req := Request{Offset: offset}
 	if !p.DirectPlay && p.TargetFormat != "" {
+		if p.TargetGeneration == "" {
+			// The token predates generation snapshots (or a new server issued
+			// against a decision that could not pin a command). It cannot be
+			// proven to match a committed configuration, so the client must
+			// re-negotiate instead of risking audio from a superseded profile.
+			log.Info(ctx, "Transcode token carries no configuration generation", "mediaID", mf.ID,
+				"format", p.TargetFormat)
+			return Request{}, ErrTokenStale
+		}
+		snapshot, ok := EffectiveTranscoding(ctx, s.ds, p.TargetFormat)
+		if !ok || TranscodingGeneration(snapshot) != p.TargetGeneration {
+			log.Info(ctx, "Transcode token generation is no longer committed", "mediaID", mf.ID,
+				"format", p.TargetFormat, "tokenGeneration", p.TargetGeneration)
+			return Request{}, ErrTokenStale
+		}
 		req.Format = p.TargetFormat
 		req.BitRate = p.TargetBitrate
 		req.SampleRate = p.TargetSampleRate
 		req.BitDepth = p.TargetBitDepth
 		req.Channels = p.TargetChannels
+		req.Generation = p.TargetGeneration
 	}
 	return req, nil
 }

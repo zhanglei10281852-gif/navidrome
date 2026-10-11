@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -88,6 +89,20 @@ func (p *players) refresh(ctx context.Context, plr *model.Player, userAgent, ip 
 		return plr, nil, nil
 	}
 	trc, err := p.ds.Transcoding().Get(ctx, plr.TranscodingId)
+	if errors.Is(err, model.ErrNotFound) {
+		// The referenced profile is gone. New deletes are rejected while
+		// referenced, but rows orphaned before that guard existed must not keep
+		// breaking playback: deterministically fall back to "no forced
+		// transcoding" and synchronize the player reference with the commit.
+		log.Warn(ctx, "Player references a deleted transcoding; clearing the stale reference",
+			"id", plr.ID, "client", plr.Client, "transcodingId", plr.TranscodingId)
+		plr.TranscodingId = ""
+		if putErr := p.ds.Player().Put(ctx, plr); putErr != nil {
+			log.Warn(ctx, "Could not clear stale transcoding reference from player",
+				"id", plr.ID, "transcodingId", plr.TranscodingId, putErr)
+		}
+		return plr, nil, nil
+	}
 	return plr, trc, err
 }
 

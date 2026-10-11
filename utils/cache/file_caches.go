@@ -61,6 +61,47 @@ type FileCache interface {
 	Disabled(ctx context.Context) bool
 }
 
+// AdoptionDecision tells the startup scan what to do with an entry found on disk.
+type AdoptionDecision int
+
+const (
+	// AdoptCurrent loads the entry into the cache and keeps its data file.
+	AdoptCurrent AdoptionDecision = iota
+	// PruneEntry deletes the data file and its completion marker. The entry
+	// cannot be proven to belong to a currently committed snapshot (e.g. it
+	// was produced by a superseded configuration generation).
+	PruneEntry
+	// RetainEntry skips adoption but keeps the file on disk, so it is
+	// reconsidered on the next startup. Used when eligibility cannot be
+	// decided yet (e.g. a transient store error); the entry is never served.
+	RetainEntry
+)
+
+// Option customizes a FileCache created with NewFileCache.
+type Option func(*fileCache)
+
+// WithCompletionPayload stores payload in every successfully written entry's
+// completion marker. Together with WithAdoptionPolicy it lets a restart tell
+// committed-snapshot entries apart from stale ones. The payload doubles as the
+// adoption key, so it should be short and stable (e.g. a content hash).
+func WithCompletionPayload(payload func(item Item) string) Option {
+	return func(fc *fileCache) {
+		fc.completionPayload = payload
+	}
+}
+
+// WithAdoptionPolicy gates which on-disk entries are restored on startup. The
+// loader returns the set of payloads (as recorded by WithCompletionPayload)
+// currently eligible for adoption; it is evaluated once per startup. Entries
+// whose payload is not in the set are pruned; a loader error retains them on
+// disk without adopting, so a transient store failure can neither serve stale
+// data nor destroy entries that might still be valid.
+func WithAdoptionPolicy(loader func(ctx context.Context) (map[string]struct{}, error)) Option {
+	return func(fc *fileCache) {
+		fc.adoptionLoader = loader
+	}
+}
+
 // NewFileCache creates a new FileCache. This function initializes the cache and starts it in the background.
 //
 //	name: A string representing the name of the cache.
@@ -75,7 +116,7 @@ type FileCache interface {
 //	    // Implement the logic to retrieve the data for the given item
 //	    return strings.NewReader(item.Key()), nil
 //	})
-func NewFileCache(name, cacheSize, cacheFolder string, maxItems int, getReader ReadFunc) FileCache {
+func NewFileCache(name, cacheSize, cacheFolder string, maxItems int, getReader ReadFunc, opts ...Option) FileCache {
 	fc := &fileCache{
 		name:        name,
 		cacheSize:   cacheSize,
@@ -84,10 +125,13 @@ func NewFileCache(name, cacheSize, cacheFolder string, maxItems int, getReader R
 		getReader:   getReader,
 		mutex:       &sync.RWMutex{},
 	}
+	for _, opt := range opts {
+		opt(fc)
+	}
 
 	go func() {
 		start := time.Now()
-		cache, sfs, err := newFSCache(fc.name, fc.cacheSize, fc.cacheFolder, fc.maxItems)
+		cache, sfs, err := newFSCache(fc.name, fc.cacheSize, fc.cacheFolder, fc.maxItems, fc.adoptionGate())
 		fc.mutex.Lock()
 		defer fc.mutex.Unlock()
 		fc.cache = cache
@@ -107,16 +151,56 @@ func NewFileCache(name, cacheSize, cacheFolder string, maxItems int, getReader R
 }
 
 type fileCache struct {
-	name        string
-	cacheSize   string
-	cacheFolder string
-	maxItems    int
-	cache       fscache.Cache
-	fs          *spreadFS
-	getReader   ReadFunc
-	disabled    bool
-	ready       atomic.Bool
-	mutex       *sync.RWMutex
+	name              string
+	cacheSize         string
+	cacheFolder       string
+	maxItems          int
+	cache             fscache.Cache
+	fs                *spreadFS
+	getReader         ReadFunc
+	completionPayload func(item Item) string
+	adoptionLoader    func(ctx context.Context) (map[string]struct{}, error)
+	disabled          bool
+	ready             atomic.Bool
+	mutex             *sync.RWMutex
+}
+
+// adoptionGate builds the per-startup payload predicate for the spread FS. It
+// returns nil when no policy was configured, which keeps the default
+// "adopt every complete entry" behavior.
+func (fc *fileCache) adoptionGate() func(payload string) AdoptionDecision {
+	if fc.adoptionLoader == nil {
+		return nil
+	}
+	gate := &adoptionGate{load: fc.adoptionLoader}
+	return gate.decide
+}
+
+// adoptionGate resolves the eligible payload set lazily, exactly once per
+// startup, while the filesystem scan walks the cache directory.
+type adoptionGate struct {
+	once  sync.Once
+	valid map[string]struct{}
+	err   error
+	load  func(ctx context.Context) (map[string]struct{}, error)
+}
+
+func (g *adoptionGate) decide(payload string) AdoptionDecision {
+	g.once.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		g.valid, g.err = g.load(ctx)
+	})
+	if g.err != nil {
+		// Eligibility is unknown: do not serve the entry, but keep its bytes so
+		// a later startup can re-evaluate once the store is reachable again.
+		log.Warn("Could not determine committed cache generations; skipping adoption for this startup", g.err)
+		return RetainEntry
+	}
+	if _, ok := g.valid[payload]; ok {
+		return AdoptCurrent
+	}
+	return PruneEntry
 }
 
 func (fc *fileCache) Available(_ context.Context) bool {
@@ -182,8 +266,12 @@ func (fc *fileCache) Get(ctx context.Context, arg Item) (*CachedStream, error) {
 			_ = fc.invalidate(ctx, key)
 			return nil, err
 		}
+		payload := ""
+		if fc.completionPayload != nil {
+			payload = fc.completionPayload(arg)
+		}
 		go func() {
-			if err := fc.copyAndClose(ctx, key, w, reader); err != nil {
+			if err := fc.copyAndClose(ctx, key, w, reader, payload); err != nil {
 				log.Debug(ctx, "Error storing file in cache", "cache", fc.name, "key", key, err)
 				_ = fc.invalidate(ctx, key)
 			} else {
@@ -242,8 +330,9 @@ func getFinalCachedSize(r fscache.ReadAtCloser) int64 {
 	return -1
 }
 
-// copyAndClose marks the entry complete before closing w, so EOF implies the entry is settled on disk.
-func (fc *fileCache) copyAndClose(ctx context.Context, key string, w io.WriteCloser, r io.Reader) error {
+// copyAndClose marks the entry complete (recording its generation payload)
+// before closing w, so EOF implies the entry is settled on disk.
+func (fc *fileCache) copyAndClose(ctx context.Context, key string, w io.WriteCloser, r io.Reader, payload string) error {
 	_, err := io.Copy(w, r)
 	if err != nil {
 		err = fmt.Errorf("copying data to cache: %w", err)
@@ -254,7 +343,7 @@ func (fc *fileCache) copyAndClose(ctx context.Context, key string, w io.WriteClo
 		}
 	}
 	if err == nil {
-		fc.markComplete(ctx, key)
+		fc.markComplete(ctx, key, payload)
 	} else if cw, ok := w.(interface{ CloseWithError(error) error }); ok {
 		// Cancel instead of close, so readers fail with the cause rather than
 		// draining a truncated entry to a clean EOF.
@@ -273,18 +362,19 @@ func (fc *fileCache) copyAndClose(ctx context.Context, key string, w io.WriteClo
 	return err
 }
 
-// markComplete records on disk that the entry for key was written in full,
-// so it is eligible for adoption after a restart (see spreadFS.Reload).
-func (fc *fileCache) markComplete(ctx context.Context, key string) {
+// markComplete records on disk that the entry for key was written in full and
+// which generation payload it belongs to, so it is eligible for adoption after
+// a restart only when that generation is still committed (see spreadFS.Reload).
+func (fc *fileCache) markComplete(ctx context.Context, key, payload string) {
 	if fc.fs == nil {
 		return
 	}
-	if err := fc.fs.MarkComplete(key); err != nil {
+	if err := fc.fs.MarkCompleteWith(key, payload); err != nil {
 		log.Warn(ctx, "Error writing cache completion marker", "cache", fc.name, "key", key, err)
 	}
 }
 
-func newFSCache(name, cacheSize, cacheFolder string, maxItems int) (fscache.Cache, *spreadFS, error) {
+func newFSCache(name, cacheSize, cacheFolder string, maxItems int, adoption func(payload string) AdoptionDecision) (fscache.Cache, *spreadFS, error) {
 	size, err := humanize.ParseBytes(cacheSize)
 	if err != nil {
 		log.Error("Invalid cache size. Using default size", "cache", name, "size", cacheSize,
@@ -307,6 +397,10 @@ func newFSCache(name, cacheSize, cacheFolder string, maxItems int) (fscache.Cach
 		log.Error(fmt.Sprintf("Error initializing %s cache FS", name), err)
 		return nil, nil, err
 	}
+	// Must be installed before fscache scans the directory in
+	// NewCacheWithHaunter below, so the very first Reload already filters by
+	// generation instead of briefly adopting stale entries.
+	fs.SetAdoptionPolicy(adoption)
 
 	ck, err := fscache.NewCacheWithHaunter(fs, h)
 	if err != nil {

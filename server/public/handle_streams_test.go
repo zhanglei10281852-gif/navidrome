@@ -162,7 +162,11 @@ var _ = Describe("handleStream", func() {
 		token, _ := auth.CreateExpiringPublicToken(time.Now().Add(time.Hour), claims)
 		makeRequest(token)
 
-		Expect(streamer.req).To(Equal(stream.Request{Format: "opus", BitRate: 128, SampleRate: 48000, Channels: 2}))
+		Expect(streamer.req.Format).To(Equal("opus"))
+		Expect(streamer.req.BitRate).To(Equal(128))
+		Expect(streamer.req.SampleRate).To(Equal(48000))
+		Expect(streamer.req.Channels).To(Equal(2))
+		Expect(streamer.req.Generation).ToNot(BeEmpty(), "the share playback must be pinned to a committed generation")
 	})
 
 	It("returns 404 when the track is outside the share owner's libraries", func() {

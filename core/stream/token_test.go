@@ -242,6 +242,64 @@ var _ = Describe("Token", func() {
 			_, err = svc.ResolveRequestFromToken(ctx, tokenStr, mf, 0)
 			Expect(err).To(MatchError(ErrTokenInvalid))
 		})
+
+		It("pins the transcoding generation into the resolved stream request", func() {
+			generation, ok := EffectiveGeneration(ctx, ds, "mp3")
+			Expect(ok).To(BeTrue())
+			decision := &TranscodeDecision{
+				MediaID:          "song-1",
+				CanTranscode:     true,
+				TargetFormat:     "mp3",
+				TargetBitrate:    192,
+				TargetGeneration: generation,
+				SourceUpdatedAt:  sourceTime,
+			}
+			token, err := svc.CreateTranscodeParams(decision)
+			Expect(err).ToNot(HaveOccurred())
+
+			mf := &model.MediaFile{ID: "song-1", UpdatedAt: sourceTime}
+			req, err := svc.ResolveRequestFromToken(ctx, token, mf, 0)
+			Expect(err).ToNot(HaveOccurred())
+			Expect(req.Format).To(Equal("mp3"))
+			Expect(req.Generation).To(Equal(generation))
+		})
+
+		It("returns ErrTokenStale when the pinned generation is no longer committed", func() {
+			generation, ok := EffectiveGeneration(ctx, ds, "mp3")
+			Expect(ok).To(BeTrue())
+			token, err := svc.CreateTranscodeParams(&TranscodeDecision{
+				MediaID:          "song-1",
+				CanTranscode:     true,
+				TargetFormat:     "mp3",
+				TargetBitrate:    192,
+				TargetGeneration: generation,
+				SourceUpdatedAt:  sourceTime,
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			// Admin changes the mp3 command after the decision was issued.
+			ds.MockedTranscoding = &tests.MockTranscodingRepo{Data: map[string]*model.Transcoding{
+				"mp3": {ID: "mp31", TargetFormat: "mp3", DefaultBitRate: 192, Command: "ffmpeg -brand-new-command -f mp3 -"},
+			}}
+
+			mf := &model.MediaFile{ID: "song-1", UpdatedAt: sourceTime}
+			_, err = svc.ResolveRequestFromToken(ctx, token, mf, 0)
+			Expect(err).To(MatchError(ErrTokenStale))
+		})
+
+		It("returns ErrTokenStale for a transcode token without a generation claim", func() {
+			token, err := auth.EncodeToken(map[string]any{
+				"mid": "song-1",
+				"ua":  sourceTime.Unix(),
+				"f":   "mp3",
+				"b":   192,
+			})
+			Expect(err).ToNot(HaveOccurred())
+
+			mf := &model.MediaFile{ID: "song-1", UpdatedAt: sourceTime}
+			_, err = svc.ResolveRequestFromToken(ctx, token, mf, 0)
+			Expect(err).To(MatchError(ErrTokenStale))
+		})
 	})
 
 	Describe("paramsFromToken", func() {

@@ -18,9 +18,10 @@ const completeMarkerSuffix = ".complete"
 const sentinelName = ".nd-migrated"
 
 type spreadFS struct {
-	root string
-	mode os.FileMode
-	init func() error
+	root    string
+	mode    os.FileMode
+	init    func() error
+	adopt   func(payload string) AdoptionDecision
 }
 
 // NewSpreadFS returns a FileSystem rooted at directory dir. This FS hashes the key and
@@ -42,6 +43,13 @@ func NewSpreadFS(dir string, mode os.FileMode) (*spreadFS, error) {
 	return f, f.init()
 }
 
+// SetAdoptionPolicy installs the gate applied while reloading the cache
+// directory. A nil policy restores the default: every marked entry is adopted.
+// It must be set before the filesystem is scanned on cache construction.
+func (sfs *spreadFS) SetAdoptionPolicy(adopt func(payload string) AdoptionDecision) {
+	sfs.adopt = adopt
+}
+
 func (sfs *spreadFS) Reload(f func(key string, name string)) error {
 	// On the first run after upgrade (no sentinel yet), pre-existing files have
 	// no completion marker. Migrate them instead of discarding them as partials,
@@ -53,7 +61,8 @@ func (sfs *spreadFS) Reload(f func(key string, name string)) error {
 
 	count := 0
 	err := sfs.walkDataFiles(func(absoluteFilePath string) {
-		if _, statErr := os.Stat(sfs.markerPath(absoluteFilePath)); statErr != nil {
+		marker := sfs.markerPath(absoluteFilePath)
+		if _, statErr := os.Stat(marker); statErr != nil {
 			switch {
 			case migrating:
 				if mErr := sfs.MarkComplete(absoluteFilePath); mErr != nil {
@@ -69,6 +78,29 @@ func (sfs *spreadFS) Reload(f func(key string, name string)) error {
 				// skip adoption without destroying a possibly-valid entry.
 				log.Warn("Error reading cache completion marker", "file", absoluteFilePath, statErr)
 				return
+			}
+		} else if sfs.adopt != nil {
+			payload := ""
+			if data, readErr := os.ReadFile(marker); readErr == nil {
+				payload = strings.TrimSpace(string(data))
+			} else if !os.IsNotExist(readErr) {
+				log.Warn("Error reading cache completion marker", "file", absoluteFilePath, readErr)
+				return
+			}
+			switch sfs.adopt(payload) {
+			case PruneEntry:
+				// Belongs to a generation that is no longer committed (or its
+				// lineage cannot be established): never serve it, free the space.
+				log.Debug("Removing cache entry outside committed generations", "file", absoluteFilePath, "payload", payload)
+				if rmErr := sfs.Remove(absoluteFilePath); rmErr != nil {
+					log.Warn("Error pruning stale cache file", "file", absoluteFilePath, rmErr)
+				}
+				return
+			case RetainEntry:
+				// Eligibility undecided this startup: leave the bytes on disk
+				// but do not load them into the cache.
+				return
+			case AdoptCurrent:
 			}
 		}
 		f(absoluteFilePath, absoluteFilePath)
@@ -145,11 +177,36 @@ func (sfs *spreadFS) markerPath(dataPath string) string {
 // key may be an original cache key or an already-mapped data path; KeyMapper
 // is idempotent for the latter (see KeyMapper).
 func (sfs *spreadFS) MarkComplete(key string) error {
-	f, err := os.OpenFile(sfs.markerPath(sfs.KeyMapper(key)), os.O_CREATE|os.O_WRONLY, 0600)
+	return sfs.MarkCompleteWith(key, "")
+}
+
+// MarkCompleteWith is MarkComplete plus the generation payload recorded in the
+// marker. The payload is written atomically (temp file + rename), so a crash
+// leaves either no marker or a complete marker with the full payload — never a
+// torn one.
+func (sfs *spreadFS) MarkCompleteWith(key, payload string) error {
+	marker := sfs.markerPath(sfs.KeyMapper(key))
+	tmp := marker + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
-	return f.Close()
+	if _, err = f.WriteString(payload); err != nil {
+		_ = f.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err = f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	// Rename over an existing marker fails on Windows; a marker is written
+	// exactly once per entry lifetime (Remove deletes it first), so removing a
+	// pre-existing one is only a defensive measure.
+	if _, err = os.Stat(marker); err == nil {
+		_ = os.Remove(marker)
+	}
+	return os.Rename(tmp, marker)
 }
 
 func (sfs *spreadFS) Remove(name string) error {

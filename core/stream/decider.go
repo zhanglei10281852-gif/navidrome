@@ -92,13 +92,14 @@ func (s *deciderService) MakeDecision(ctx context.Context, mf *model.MediaFile, 
 
 	// Try transcoding profiles (in order of preference)
 	for _, profile := range clientInfo.TranscodingProfiles {
-		if ts, transcodeFormat := s.computeTranscodedStream(ctx, src, &profile, clientInfo); ts != nil {
+		if ts, transcodeFormat, generation := s.computeTranscodedStream(ctx, src, &profile, clientInfo); ts != nil {
 			decision.CanTranscode = true
 			decision.TargetFormat = transcodeFormat
 			decision.TargetBitrate = ts.Bitrate
 			decision.TargetChannels = ts.Channels
 			decision.TargetSampleRate = ts.SampleRate
 			decision.TargetBitDepth = ts.BitDepth
+			decision.TargetGeneration = generation
 			decision.TranscodeStream = ts
 			break
 		}
@@ -236,33 +237,37 @@ func (s *deciderService) checkDirectPlayProfile(src *Details, profile *DirectPla
 }
 
 // computeTranscodedStream attempts to build a valid transcoded stream for the given profile.
-// Returns the stream details and the internal transcoding format (which may differ from the
-// response container when a codec fallback occurs, e.g., "mp4"→"aac").
-// Returns nil, "" if the profile cannot produce a valid output.
-func (s *deciderService) computeTranscodedStream(ctx context.Context, src *Details, profile *Profile, clientInfo *ClientInfo) (*Details, string) {
+// Returns the stream details, the internal transcoding format (which may differ from the
+// response container when a codec fallback occurs, e.g., "mp4"→"aac") and the generation of
+// the committed transcoding snapshot the output was resolved against.
+// Returns nil, "", "" if the profile cannot produce a valid output.
+func (s *deciderService) computeTranscodedStream(ctx context.Context, src *Details, profile *Profile, clientInfo *ClientInfo) (*Details, string, string) {
 	// Check protocol (only http for now)
 	if profile.Protocol != "" && !strings.EqualFold(profile.Protocol, ProtocolHTTP) {
 		log.Trace(ctx, "Skipping transcoding profile: unsupported protocol", "protocol", profile.Protocol)
-		return nil, ""
+		return nil, "", ""
 	}
 
 	responseContainer, targetFormat := resolveTargetFormat(profile)
 	if targetFormat == "" {
-		return nil, ""
+		return nil, "", ""
 	}
 
-	// Verify we have a transcoding command available (DB custom or built-in default)
-	if LookupTranscodeCommand(ctx, s.ds, targetFormat) == "" {
+	// Resolve the committed snapshot (DB custom command or built-in default)
+	// and pin the decision to its generation.
+	snapshot, ok := EffectiveTranscoding(ctx, s.ds, targetFormat)
+	if !ok {
 		log.Trace(ctx, "Skipping transcoding profile: no transcoding command available", "targetFormat", targetFormat)
-		return nil, ""
+		return nil, "", ""
 	}
+	generation := TranscodingGeneration(snapshot)
 
 	targetIsLossless := isLosslessFormat(targetFormat)
 
 	// Reject lossy to lossless conversion
 	if !src.IsLossless && targetIsLossless {
 		log.Trace(ctx, "Skipping transcoding profile: lossy to lossless not allowed", "targetFormat", targetFormat)
-		return nil, ""
+		return nil, "", ""
 	}
 
 	ts := &Details{
@@ -290,7 +295,7 @@ func (s *deciderService) computeTranscodedStream(ctx context.Context, src *Detai
 
 	// Determine target bitrate (all in kbps)
 	if ok := s.computeBitrate(ctx, src, targetFormat, targetIsLossless, clientInfo, ts); !ok {
-		return nil, ""
+		return nil, "", ""
 	}
 
 	// Apply MaxAudioChannels from the transcoding profile. Compare against the
@@ -302,10 +307,10 @@ func (s *deciderService) computeTranscodedStream(ctx context.Context, src *Detai
 
 	// Apply codec profile limitations to the TARGET codec
 	if ok := s.applyCodecLimitations(ctx, src.Bitrate, targetFormat, targetIsLossless, clientInfo, ts); !ok {
-		return nil, ""
+		return nil, "", ""
 	}
 
-	return ts, targetFormat
+	return ts, targetFormat, generation
 }
 
 // lookupDefaultBitrate returns the default bitrate for the given format.
@@ -321,23 +326,6 @@ func lookupDefaultBitrate(ctx context.Context, ds model.DataStore, format string
 		}
 	}
 	return fallbackBitrate
-}
-
-// LookupTranscodeCommand returns the ffmpeg command for the given format.
-// It checks the DB first (for user-customized commands), then falls back to
-// the built-in default command. Returns "" if the format is unknown.
-func LookupTranscodeCommand(ctx context.Context, ds model.DataStore, format string) string {
-	t, err := ds.Transcoding().FindByFormat(ctx, format)
-	if err == nil && t.Command != "" {
-		return t.Command
-	}
-	// Fall back to built-in defaults
-	for _, dt := range consts.DefaultTranscodings {
-		if dt.TargetFormat == format {
-			return dt.Command
-		}
-	}
-	return ""
 }
 
 // resolveTargetFormat determines the response container and internal target format

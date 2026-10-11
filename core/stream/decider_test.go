@@ -255,16 +255,36 @@ var _ = Describe("Decider", func() {
 					},
 				}
 				decision, err := svc.MakeDecision(ctx, mf, ci, TranscodeOptions{})
-				Expect(err).ToNot(HaveOccurred())
-				Expect(decision.CanDirectPlay).To(BeFalse())
-				Expect(decision.CanTranscode).To(BeTrue())
-				Expect(decision.TargetFormat).To(Equal("mp3"))
-				Expect(decision.TargetBitrate).To(Equal(256)) // kbps
-				Expect(decision.TranscodeReasons).To(ContainElement(And(
-					ContainSubstring("container 'flac' not supported"),
-					ContainSubstring("[mp3]"),
-				)))
-			})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(decision.CanDirectPlay).To(BeFalse())
+			Expect(decision.CanTranscode).To(BeTrue())
+			Expect(decision.TargetFormat).To(Equal("mp3"))
+			Expect(decision.TargetBitrate).To(Equal(256)) // kbps
+			expectedGen, genOK := EffectiveGeneration(ctx, ds, "mp3")
+			Expect(genOK).To(BeTrue())
+			Expect(decision.TargetGeneration).To(Equal(expectedGen),
+				"the decision must be pinned to the committed configuration generation")
+			Expect(decision.TranscodeReasons).To(ContainElement(And(
+				ContainSubstring("container 'flac' not supported"),
+				ContainSubstring("[mp3]"),
+			)))
+		})
+
+		It("leaves the generation empty for a direct play decision", func() {
+			mf := withProbe(&model.MediaFile{ID: "1", Suffix: "mp3", Codec: "MP3", BitRate: 320, Channels: 2})
+			ci := &ClientInfo{
+				DirectPlayProfiles: []DirectPlayProfile{
+					{Containers: []string{"mp3"}, AudioCodecs: []string{"mp3"}, Protocols: []string{ProtocolHTTP}},
+				},
+				TranscodingProfiles: []Profile{
+					{Container: "flac", Protocol: ProtocolHTTP},
+				},
+			}
+			decision, err := svc.MakeDecision(ctx, mf, ci, TranscodeOptions{})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(decision.CanDirectPlay).To(BeTrue())
+			Expect(decision.TargetGeneration).To(BeEmpty())
+		})
 
 			It("rejects lossy to lossless transcoding", func() {
 				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "mp3", Codec: "MP3", BitRate: 320, Channels: 2})

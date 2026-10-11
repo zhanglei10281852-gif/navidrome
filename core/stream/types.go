@@ -9,6 +9,13 @@ import (
 var (
 	ErrTokenInvalid = errors.New("invalid or expired transcode token")
 	ErrTokenStale   = errors.New("transcode token is stale: media file has changed")
+	// ErrTranscodeConfigChanged is returned when a playback pinned to a
+	// transcoding generation would have to launch a different (newer or
+	// deleted) configuration than the one its decision snapshot was taken
+	// against. The caller must re-run the decision instead of being served
+	// mismatched audio, and the stale result must not populate the new
+	// generation's cache namespace.
+	ErrTranscodeConfigChanged = errors.New("transcoding configuration changed since the playback decision was made")
 )
 
 // TranscodeOptions controls optional behavior of MakeTranscodeDecision.
@@ -26,6 +33,10 @@ type Request struct {
 	BitDepth   int
 	Channels   int
 	Offset     int // seconds
+	// Generation pins the committed transcoding configuration the decision was
+	// taken against. The ffmpeg command and the cache namespace are both bound
+	// to it, so a single playback never mixes snapshots. Empty for raw streams.
+	Generation string
 }
 
 // ClientInfo represents client playback capabilities.
@@ -178,6 +189,10 @@ type TranscodeDecision struct {
 	TargetChannels   int
 	TargetSampleRate int
 	TargetBitDepth   int
+	// TargetGeneration identifies the committed transcoding configuration the
+	// decision resolved to. It is carried into the playback token so the later
+	// stream request runs the exact same snapshot.
+	TargetGeneration string
 	SourceStream     Details
 	SourceUpdatedAt  time.Time
 	TranscodeStream  *Details

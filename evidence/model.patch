@@ -1,0 +1,1735 @@
+diff --git a/cmd/wire_gen.go b/cmd/wire_gen.go
+index 2a396689d..73239ca4f 100644
+--- a/cmd/wire_gen.go
++++ b/cmd/wire_gen.go
+@@ -93,7 +93,7 @@ func CreateSubsonicAPIRouter(ctx context.Context) *subsonic.Router {
+ 	imageStore := artwork.GetImageStore()
+ 	fFmpeg := ffmpeg.New()
+ 	artworkArtwork := artwork.NewArtwork(dataStore, fileCache, imageStore, fFmpeg)
+-	transcodingCache := stream.GetTranscodingCache()
++	transcodingCache := stream.GetTranscodingCache(dataStore)
+ 	mediaStreamer := stream.NewMediaStreamer(dataStore, fFmpeg, transcodingCache)
+ 	transcodeDecider := stream.NewTranscodeDecider(dataStore, fFmpeg)
+ 	share := core.NewShare(dataStore)
+@@ -123,7 +123,7 @@ func CreateJellyfinAPIRouter(ctx context.Context) *jellyfin.Router {
+ 	imageStore := artwork.GetImageStore()
+ 	fFmpeg := ffmpeg.New()
+ 	artworkArtwork := artwork.NewArtwork(dataStore, fileCache, imageStore, fFmpeg)
+-	transcodingCache := stream.GetTranscodingCache()
++	transcodingCache := stream.GetTranscodingCache(dataStore)
+ 	mediaStreamer := stream.NewMediaStreamer(dataStore, fFmpeg, transcodingCache)
+ 	transcodeDecider := stream.NewTranscodeDecider(dataStore, fFmpeg)
+ 	players := core.NewPlayers(dataStore)
+@@ -157,7 +157,7 @@ func CreatePublicRouter() *public.Router {
+ 	imageStore := artwork.GetImageStore()
+ 	fFmpeg := ffmpeg.New()
+ 	artworkArtwork := artwork.NewArtwork(dataStore, fileCache, imageStore, fFmpeg)
+-	transcodingCache := stream.GetTranscodingCache()
++	transcodingCache := stream.GetTranscodingCache(dataStore)
+ 	mediaStreamer := stream.NewMediaStreamer(dataStore, fFmpeg, transcodingCache)
+ 	transcodeDecider := stream.NewTranscodeDecider(dataStore, fFmpeg)
+ 	share := core.NewShare(dataStore)
+diff --git a/core/players.go b/core/players.go
+index 6fe86fd70..d67d25859 100644
+--- a/core/players.go
++++ b/core/players.go
+@@ -2,6 +2,7 @@ package core
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"time"
+ 
+@@ -88,6 +89,20 @@ func (p *players) refresh(ctx context.Context, plr *model.Player, userAgent, ip
+ 		return plr, nil, nil
+ 	}
+ 	trc, err := p.ds.Transcoding().Get(ctx, plr.TranscodingId)
++	if errors.Is(err, model.ErrNotFound) {
++		// The referenced profile is gone. New deletes are rejected while
++		// referenced, but rows orphaned before that guard existed must not keep
++		// breaking playback: deterministically fall back to "no forced
++		// transcoding" and synchronize the player reference with the commit.
++		log.Warn(ctx, "Player references a deleted transcoding; clearing the stale reference",
++			"id", plr.ID, "client", plr.Client, "transcodingId", plr.TranscodingId)
++		plr.TranscodingId = ""
++		if putErr := p.ds.Player().Put(ctx, plr); putErr != nil {
++			log.Warn(ctx, "Could not clear stale transcoding reference from player",
++				"id", plr.ID, "transcodingId", plr.TranscodingId, putErr)
++		}
++		return plr, nil, nil
++	}
+ 	return plr, trc, err
+ }
+ 
+diff --git a/core/players_test.go b/core/players_test.go
+index e452c52ba..3cbcc5b8c 100644
+--- a/core/players_test.go
++++ b/core/players_test.go
+@@ -114,6 +114,20 @@ var _ = Describe("Players", func() {
+ 			Expect(trc.ID).To(Equal("1"))
+ 		})
+ 
++		It("clears a dangling transcoding reference deterministically", func() {
++			plr := &model.Player{ID: "123", Name: "A Player", Client: "client", UserId: "userid", TranscodingId: "ghost"}
++			repo.add(plr)
++			localDS := &tests.MockDataStore{MockedPlayer: repo, MockedTranscoding: missingTranscodingRepo{}}
++			ps := NewPlayers(localDS)
++
++			p, trc, err := ps.Register(ctx, "123", "client", "chrome", "1.2.3.4")
++			Expect(err).ToNot(HaveOccurred())
++			Expect(trc).To(BeNil())
++			Expect(p.TranscodingId).To(BeEmpty())
++			Expect(repo.lastSaved).ToNot(BeNil())
++			Expect(repo.lastSaved.TranscodingId).To(BeEmpty(), "the player reference must be synced to the fallback")
++		})
++
+ 		It("does not rename a player that has an API key", func() {
+ 			plr := &model.Player{ID: "123", Name: "My Phone", Client: "client", UserId: "userid", HasAPIKey: true}
+ 			repo.add(plr)
+@@ -202,3 +216,12 @@ func (m *mockPlayerRepository) Put(_ context.Context, p *model.Player) error {
+ 	m.lastSaved = p
+ 	return nil
+ }
++
++// missingTranscodingRepo simulates a transcoding row that has been deleted.
++type missingTranscodingRepo struct {
++	model.TranscodingRepository
++}
++
++func (missingTranscodingRepo) Get(context.Context, string) (*model.Transcoding, error) {
++	return nil, model.ErrNotFound
++}
+diff --git a/core/stream/decider.go b/core/stream/decider.go
+index 38839cdf0..a086f68ad 100644
+--- a/core/stream/decider.go
++++ b/core/stream/decider.go
+@@ -92,13 +92,14 @@ func (s *deciderService) MakeDecision(ctx context.Context, mf *model.MediaFile,
+ 
+ 	// Try transcoding profiles (in order of preference)
+ 	for _, profile := range clientInfo.TranscodingProfiles {
+-		if ts, transcodeFormat := s.computeTranscodedStream(ctx, src, &profile, clientInfo); ts != nil {
++		if ts, transcodeFormat, generation := s.computeTranscodedStream(ctx, src, &profile, clientInfo); ts != nil {
+ 			decision.CanTranscode = true
+ 			decision.TargetFormat = transcodeFormat
+ 			decision.TargetBitrate = ts.Bitrate
+ 			decision.TargetChannels = ts.Channels
+ 			decision.TargetSampleRate = ts.SampleRate
+ 			decision.TargetBitDepth = ts.BitDepth
++			decision.TargetGeneration = generation
+ 			decision.TranscodeStream = ts
+ 			break
+ 		}
+@@ -236,33 +237,37 @@ func (s *deciderService) checkDirectPlayProfile(src *Details, profile *DirectPla
+ }
+ 
+ // computeTranscodedStream attempts to build a valid transcoded stream for the given profile.
+-// Returns the stream details and the internal transcoding format (which may differ from the
+-// response container when a codec fallback occurs, e.g., "mp4"→"aac").
+-// Returns nil, "" if the profile cannot produce a valid output.
+-func (s *deciderService) computeTranscodedStream(ctx context.Context, src *Details, profile *Profile, clientInfo *ClientInfo) (*Details, string) {
++// Returns the stream details, the internal transcoding format (which may differ from the
++// response container when a codec fallback occurs, e.g., "mp4"→"aac") and the generation of
++// the committed transcoding snapshot the output was resolved against.
++// Returns nil, "", "" if the profile cannot produce a valid output.
++func (s *deciderService) computeTranscodedStream(ctx context.Context, src *Details, profile *Profile, clientInfo *ClientInfo) (*Details, string, string) {
+ 	// Check protocol (only http for now)
+ 	if profile.Protocol != "" && !strings.EqualFold(profile.Protocol, ProtocolHTTP) {
+ 		log.Trace(ctx, "Skipping transcoding profile: unsupported protocol", "protocol", profile.Protocol)
+-		return nil, ""
++		return nil, "", ""
+ 	}
+ 
+ 	responseContainer, targetFormat := resolveTargetFormat(profile)
+ 	if targetFormat == "" {
+-		return nil, ""
++		return nil, "", ""
+ 	}
+ 
+-	// Verify we have a transcoding command available (DB custom or built-in default)
+-	if LookupTranscodeCommand(ctx, s.ds, targetFormat) == "" {
++	// Resolve the committed snapshot (DB custom command or built-in default)
++	// and pin the decision to its generation.
++	snapshot, ok := EffectiveTranscoding(ctx, s.ds, targetFormat)
++	if !ok {
+ 		log.Trace(ctx, "Skipping transcoding profile: no transcoding command available", "targetFormat", targetFormat)
+-		return nil, ""
++		return nil, "", ""
+ 	}
++	generation := TranscodingGeneration(snapshot)
+ 
+ 	targetIsLossless := isLosslessFormat(targetFormat)
+ 
+ 	// Reject lossy to lossless conversion
+ 	if !src.IsLossless && targetIsLossless {
+ 		log.Trace(ctx, "Skipping transcoding profile: lossy to lossless not allowed", "targetFormat", targetFormat)
+-		return nil, ""
++		return nil, "", ""
+ 	}
+ 
+ 	ts := &Details{
+@@ -290,7 +295,7 @@ func (s *deciderService) computeTranscodedStream(ctx context.Context, src *Detai
+ 
+ 	// Determine target bitrate (all in kbps)
+ 	if ok := s.computeBitrate(ctx, src, targetFormat, targetIsLossless, clientInfo, ts); !ok {
+-		return nil, ""
++		return nil, "", ""
+ 	}
+ 
+ 	// Apply MaxAudioChannels from the transcoding profile. Compare against the
+@@ -302,10 +307,10 @@ func (s *deciderService) computeTranscodedStream(ctx context.Context, src *Detai
+ 
+ 	// Apply codec profile limitations to the TARGET codec
+ 	if ok := s.applyCodecLimitations(ctx, src.Bitrate, targetFormat, targetIsLossless, clientInfo, ts); !ok {
+-		return nil, ""
++		return nil, "", ""
+ 	}
+ 
+-	return ts, targetFormat
++	return ts, targetFormat, generation
+ }
+ 
+ // lookupDefaultBitrate returns the default bitrate for the given format.
+@@ -323,23 +328,6 @@ func lookupDefaultBitrate(ctx context.Context, ds model.DataStore, format string
+ 	return fallbackBitrate
+ }
+ 
+-// LookupTranscodeCommand returns the ffmpeg command for the given format.
+-// It checks the DB first (for user-customized commands), then falls back to
+-// the built-in default command. Returns "" if the format is unknown.
+-func LookupTranscodeCommand(ctx context.Context, ds model.DataStore, format string) string {
+-	t, err := ds.Transcoding().FindByFormat(ctx, format)
+-	if err == nil && t.Command != "" {
+-		return t.Command
+-	}
+-	// Fall back to built-in defaults
+-	for _, dt := range consts.DefaultTranscodings {
+-		if dt.TargetFormat == format {
+-			return dt.Command
+-		}
+-	}
+-	return ""
+-}
+-
+ // resolveTargetFormat determines the response container and internal target format
+ // from the profile's Container and AudioCodec fields. When an AudioCodec is specified
+ // it is preferred as targetFormat (e.g. container "mp4" with audioCodec "aac" → targetFormat "aac").
+diff --git a/core/stream/decider_test.go b/core/stream/decider_test.go
+index 01fef1249..9e8dda928 100644
+--- a/core/stream/decider_test.go
++++ b/core/stream/decider_test.go
+@@ -255,16 +255,36 @@ var _ = Describe("Decider", func() {
+ 					},
+ 				}
+ 				decision, err := svc.MakeDecision(ctx, mf, ci, TranscodeOptions{})
+-				Expect(err).ToNot(HaveOccurred())
+-				Expect(decision.CanDirectPlay).To(BeFalse())
+-				Expect(decision.CanTranscode).To(BeTrue())
+-				Expect(decision.TargetFormat).To(Equal("mp3"))
+-				Expect(decision.TargetBitrate).To(Equal(256)) // kbps
+-				Expect(decision.TranscodeReasons).To(ContainElement(And(
+-					ContainSubstring("container 'flac' not supported"),
+-					ContainSubstring("[mp3]"),
+-				)))
+-			})
++			Expect(err).ToNot(HaveOccurred())
++			Expect(decision.CanDirectPlay).To(BeFalse())
++			Expect(decision.CanTranscode).To(BeTrue())
++			Expect(decision.TargetFormat).To(Equal("mp3"))
++			Expect(decision.TargetBitrate).To(Equal(256)) // kbps
++			expectedGen, genOK := EffectiveGeneration(ctx, ds, "mp3")
++			Expect(genOK).To(BeTrue())
++			Expect(decision.TargetGeneration).To(Equal(expectedGen),
++				"the decision must be pinned to the committed configuration generation")
++			Expect(decision.TranscodeReasons).To(ContainElement(And(
++				ContainSubstring("container 'flac' not supported"),
++				ContainSubstring("[mp3]"),
++			)))
++		})
++
++		It("leaves the generation empty for a direct play decision", func() {
++			mf := withProbe(&model.MediaFile{ID: "1", Suffix: "mp3", Codec: "MP3", BitRate: 320, Channels: 2})
++			ci := &ClientInfo{
++				DirectPlayProfiles: []DirectPlayProfile{
++					{Containers: []string{"mp3"}, AudioCodecs: []string{"mp3"}, Protocols: []string{ProtocolHTTP}},
++				},
++				TranscodingProfiles: []Profile{
++					{Container: "flac", Protocol: ProtocolHTTP},
++				},
++			}
++			decision, err := svc.MakeDecision(ctx, mf, ci, TranscodeOptions{})
++			Expect(err).ToNot(HaveOccurred())
++			Expect(decision.CanDirectPlay).To(BeTrue())
++			Expect(decision.TargetGeneration).To(BeEmpty())
++		})
+ 
+ 			It("rejects lossy to lossless transcoding", func() {
+ 				mf := withProbe(&model.MediaFile{ID: "1", Suffix: "mp3", Codec: "MP3", BitRate: 320, Channels: 2})
+diff --git a/core/stream/generation.go b/core/stream/generation.go
+new file mode 100644
+index 000000000..d0378e396
+--- /dev/null
++++ b/core/stream/generation.go
+@@ -0,0 +1,127 @@
++package stream
++
++import (
++	"context"
++	"crypto/sha1"
++	"encoding/hex"
++	"fmt"
++
++	"github.com/navidrome/navidrome/consts"
++	"github.com/navidrome/navidrome/model"
++)
++
++// generationPrefix namespaces generation hashes from any other cache payload.
++const generationPrefix = "g"
++
++// TranscodingGeneration returns the content hash of one committed transcoding
++// configuration. It identifies the configuration's "generation": any change to
++// the command, target format or default bitrate produces a different
++// generation, which selects a different on-disk cache namespace and a different
++// decision snapshot.
++//
++// The hash is content-addressed on purpose: the generation switches exactly
++// when the committed DB row changes (or the built-in fallback changes in a new
++// release), while an unchanged profile keeps a stable generation and therefore
++// stable cache hits. A failed DB commit never publishes a new generation, so
++// players keep being served from the old configuration and old cache until the
++// new snapshot is durably committed.
++func TranscodingGeneration(t model.Transcoding) string {
++	h := sha1.New()
++	fmt.Fprintf(h, "%s\x00%s\x00%d", t.TargetFormat, t.Command, t.DefaultBitRate)
++	return generationPrefix + hex.EncodeToString(h.Sum(nil))
++}
++
++// defaultTranscodingFor returns the built-in transcoding definition for format.
++func defaultTranscodingFor(format string) (model.Transcoding, bool) {
++	for _, d := range consts.DefaultTranscodings {
++		if d.TargetFormat == format {
++			return model.Transcoding{
++				Name:           d.Name,
++				TargetFormat:   d.TargetFormat,
++				Command:        d.Command,
++				DefaultBitRate: d.DefaultBitRate,
++			}, true
++		}
++	}
++	return model.Transcoding{}, false
++}
++
++// EffectiveTranscoding resolves the committed transcoding snapshot for format:
++// the DB row when it defines a command, otherwise the built-in default for the
++// format. ok is false when no committed configuration can produce format.
++//
++// Every playback step (profile selection, the token snapshot and the ffmpeg
++// command launch) resolves through this function, so a playback always runs the
++// snapshot of one committed configuration.
++func EffectiveTranscoding(ctx context.Context, ds model.DataStore, format string) (model.Transcoding, bool) {
++	snapshot := model.Transcoding{TargetFormat: format}
++	if ds != nil {
++		if t, err := ds.Transcoding().FindByFormat(ctx, format); err == nil && t != nil {
++			snapshot = *t
++		}
++	}
++
++	if snapshot.Command == "" {
++		d, ok := defaultTranscodingFor(format)
++		if !ok {
++			return model.Transcoding{}, false
++		}
++		snapshot.TargetFormat = d.TargetFormat
++		snapshot.Command = d.Command
++		if snapshot.DefaultBitRate == 0 {
++			snapshot.DefaultBitRate = d.DefaultBitRate
++		}
++	}
++	return snapshot, true
++}
++
++// EffectiveGeneration resolves the committed snapshot for format and returns
++// its generation. ok is false when the format has no transcoding command.
++func EffectiveGeneration(ctx context.Context, ds model.DataStore, format string) (string, bool) {
++	t, ok := EffectiveTranscoding(ctx, ds, format)
++	if !ok {
++		return "", false
++	}
++	return TranscodingGeneration(t), true
++}
++
++// CurrentTranscodingGenerations returns the generations of every snapshot a
++// new playback can resolve to right now: committed DB rows (with the built-in
++// command fallback applied) and built-in defaults. The transcoding cache uses
++// it on startup to adopt only complete entries produced by a still-committed
++// generation.
++func CurrentTranscodingGenerations(ctx context.Context, ds model.DataStore) (map[string]struct{}, error) {
++	gens := map[string]struct{}{}
++
++	rows, err := ds.Transcoding().All(ctx)
++	if err != nil {
++		return nil, err
++	}
++	for i := range rows {
++		t := rows[i]
++		if t.Command == "" {
++			d, ok := defaultTranscodingFor(t.TargetFormat)
++			if !ok {
++				// No effective command for this row: no playback can resolve
++				// to it, so it has no current generation.
++				continue
++			}
++			t.Command = d.Command
++			if t.DefaultBitRate == 0 {
++				t.DefaultBitRate = d.DefaultBitRate
++			}
++		}
++		gens[TranscodingGeneration(t)] = struct{}{}
++	}
++
++	for _, d := range consts.DefaultTranscodings {
++		gens[TranscodingGeneration(model.Transcoding{
++			Name:           d.Name,
++			TargetFormat:   d.TargetFormat,
++			Command:        d.Command,
++			DefaultBitRate: d.DefaultBitRate,
++		})] = struct{}{}
++	}
++
++	return gens, nil
++}
+diff --git a/core/stream/generation_test.go b/core/stream/generation_test.go
+new file mode 100644
+index 000000000..b135a173d
+--- /dev/null
++++ b/core/stream/generation_test.go
+@@ -0,0 +1,133 @@
++package stream
++
++import (
++	"context"
++
++	"github.com/navidrome/navidrome/consts"
++	"github.com/navidrome/navidrome/model"
++	"github.com/navidrome/navidrome/tests"
++	. "github.com/onsi/ginkgo/v2"
++	. "github.com/onsi/gomega"
++)
++
++var _ = Describe("Transcoding generations", func() {
++	var (
++		ds  *tests.MockDataStore
++		ctx context.Context
++	)
++
++	BeforeEach(func() {
++		ctx = context.Background()
++		ds = &tests.MockDataStore{MockedTranscoding: &tests.MockTranscodingRepo{}}
++	})
++
++	Describe("TranscodingGeneration", func() {
++		It("is stable for the same configuration", func() {
++			t := model.Transcoding{TargetFormat: "mp3", Command: "ffmpeg -f mp3", DefaultBitRate: 192}
++			Expect(TranscodingGeneration(t)).To(Equal(TranscodingGeneration(t)))
++			Expect(TranscodingGeneration(t)).To(HavePrefix(generationPrefix))
++		})
++
++		It("changes when the command changes", func() {
++			old := model.Transcoding{TargetFormat: "opus", Command: "ffmpeg -c:a libopus -b:a 96k", DefaultBitRate: 96}
++			new := old
++			new.Command = "ffmpeg -c:a libopus -b:a 128k -vbr on"
++			Expect(TranscodingGeneration(new)).NotTo(Equal(TranscodingGeneration(old)))
++		})
++
++		It("changes when the target format or default bitrate changes", func() {
++			base := model.Transcoding{TargetFormat: "mp3", Command: "ffmpeg", DefaultBitRate: 192}
++			format := base
++			format.TargetFormat = "opus"
++			bitrate := base
++			bitrate.DefaultBitRate = 320
++			Expect(TranscodingGeneration(format)).NotTo(Equal(TranscodingGeneration(base)))
++			Expect(TranscodingGeneration(bitrate)).NotTo(Equal(TranscodingGeneration(base)))
++		})
++
++		It("does not depend on the row id or display name", func() {
++			a := model.Transcoding{ID: "id-1", Name: "first", TargetFormat: "mp3", Command: "ffmpeg", DefaultBitRate: 192}
++			b := model.Transcoding{ID: "id-2", Name: "renamed", TargetFormat: "mp3", Command: "ffmpeg", DefaultBitRate: 192}
++			// A rename keeps the generation (and therefore all cache hits).
++			Expect(TranscodingGeneration(b)).To(Equal(TranscodingGeneration(a)))
++		})
++	})
++
++	Describe("EffectiveTranscoding", func() {
++		It("prefers a committed DB row with a command", func() {
++			ds.MockedTranscoding = &tests.MockTranscodingRepo{Data: map[string]*model.Transcoding{
++				"mp3": {ID: "custom", TargetFormat: "mp3", Command: "custom-command", DefaultBitRate: 320},
++			}}
++			t, ok := EffectiveTranscoding(ctx, ds, "mp3")
++			Expect(ok).To(BeTrue())
++			Expect(t.ID).To(Equal("custom"))
++			Expect(t.Command).To(Equal("custom-command"))
++		})
++
++		It("falls back to the built-in command when the DB row has none", func() {
++			ds.MockedTranscoding = &tests.MockTranscodingRepo{Data: map[string]*model.Transcoding{
++				"mp3": {ID: "row", TargetFormat: "mp3", DefaultBitRate: 160},
++			}}
++			t, ok := EffectiveTranscoding(ctx, ds, "mp3")
++			Expect(ok).To(BeTrue())
++			var builtin string
++			for _, d := range consts.DefaultTranscodings {
++				if d.TargetFormat == "mp3" {
++					builtin = d.Command
++				}
++			}
++			Expect(t.Command).To(Equal(builtin))
++			Expect(t.DefaultBitRate).To(Equal(160))
++		})
++
++		It("uses the built-in default when no row exists", func() {
++			t, ok := EffectiveTranscoding(ctx, ds, "mp3")
++			Expect(ok).To(BeTrue())
++			Expect(t.Command).ToNot(BeEmpty())
++		})
++
++		It("reports false for an unknown format", func() {
++			_, ok := EffectiveTranscoding(ctx, ds, "wma-pro")
++			Expect(ok).To(BeFalse())
++		})
++
++		It("resolves identically on repeated calls (stable committed snapshot)", func() {
++			g1, ok1 := EffectiveGeneration(ctx, ds, "mp3")
++			g2, ok2 := EffectiveGeneration(ctx, ds, "mp3")
++			Expect(ok1).To(BeTrue())
++			Expect(ok2).To(BeTrue())
++			Expect(g1).To(Equal(g2))
++		})
++	})
++
++	Describe("CurrentTranscodingGenerations", func() {
++		It("includes built-in default generations", func() {
++			gens, err := CurrentTranscodingGenerations(ctx, ds)
++			Expect(err).ToNot(HaveOccurred())
++			for _, d := range consts.DefaultTranscodings {
++				Expect(gens).To(HaveKey(TranscodingGeneration(model.Transcoding{
++					Name: d.Name, TargetFormat: d.TargetFormat, Command: d.Command, DefaultBitRate: d.DefaultBitRate,
++				})))
++			}
++		})
++
++		It("includes effective generations of committed rows", func() {
++			custom := model.Transcoding{ID: "c1", Name: "custom mp3", TargetFormat: "mp3", Command: "custom-command", DefaultBitRate: 320}
++			ds.MockedTranscoding = &tests.MockTranscodingRepo{Data: map[string]*model.Transcoding{"mp3": &custom}}
++			gens, err := CurrentTranscodingGenerations(ctx, ds)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(gens).To(HaveKey(TranscodingGeneration(custom)))
++		})
++
++		It("applies the built-in command fallback to rows before hashing", func() {
++			ds.MockedTranscoding = &tests.MockTranscodingRepo{Data: map[string]*model.Transcoding{
++				"mp3": {ID: "row", TargetFormat: "mp3", DefaultBitRate: 160},
++			}}
++			gens, err := CurrentTranscodingGenerations(ctx, ds)
++			Expect(err).ToNot(HaveOccurred())
++			effective, ok := EffectiveTranscoding(ctx, ds, "mp3")
++			Expect(ok).To(BeTrue())
++			Expect(gens).To(HaveKey(TranscodingGeneration(effective)))
++		})
++	})
++})
+diff --git a/core/stream/legacy_client.go b/core/stream/legacy_client.go
+index 5b732c3e2..e8568c46a 100644
+--- a/core/stream/legacy_client.go
++++ b/core/stream/legacy_client.go
+@@ -129,6 +129,9 @@ func (s *deciderService) resolve(ctx context.Context, mf *model.MediaFile, clien
+ 		req.SampleRate = decision.TargetSampleRate
+ 		req.BitDepth = decision.TargetBitDepth
+ 		req.Channels = decision.TargetChannels
++		// Pin the whole playback (command lookup and cache namespace) to the
++		// snapshot the decision was taken against.
++		req.Generation = decision.TargetGeneration
+ 	default:
+ 		return req, false
+ 	}
+diff --git a/core/stream/media_streamer.go b/core/stream/media_streamer.go
+index c250b0c4e..1b09a758a 100644
+--- a/core/stream/media_streamer.go
++++ b/core/stream/media_streamer.go
+@@ -54,10 +54,15 @@ type streamJob struct {
+ 	bitDepth   int
+ 	channels   int
+ 	offset     int
++	// generation pins the committed transcoding configuration. It is part of
++	// the cache key, so entries from a superseded configuration are never
++	// served as hits, and late output of an in-flight transcode lands in its
++	// own (old) namespace, never in the new one.
++	generation string
+ }
+ 
+ func (j *streamJob) Key() string {
+-	return fmt.Sprintf("%s.%s.%d.%d.%d.%d.%s.%d", j.mf.ID, j.mf.UpdatedAt.Format(time.RFC3339Nano), j.bitRate, j.sampleRate, j.bitDepth, j.channels, j.format, j.offset)
++	return fmt.Sprintf("%s.%s.%d.%d.%d.%d.%s.%d.%s", j.mf.ID, j.mf.UpdatedAt.Format(time.RFC3339Nano), j.bitRate, j.sampleRate, j.bitDepth, j.channels, j.format, j.offset, j.generation)
+ }
+ 
+ // NewStream creates a Stream for the given MediaFile and Request. It handles both raw streaming (no transcoding)
+@@ -98,6 +103,27 @@ func (ms *mediaStreamer) NewStream(ctx context.Context, mf *model.MediaFile, req
+ 		return s, nil
+ 	}
+ 
++	// Pin the committed configuration snapshot for this playback. Callers that
++	// went through the decision (all production paths) already carry the
++	// generation; resolve it here for direct callers so the command lookup and
++	// the cache namespace always share one snapshot.
++	generation := req.Generation
++	if generation == "" {
++		g, ok := EffectiveGeneration(ctx, ms.ds, format)
++		if !ok {
++			log.Error(ctx, "No transcoding command available", "id", mf.ID, "format", format)
++			return nil, os.ErrInvalid
++		}
++		generation = g
++	} else if snapshot, ok := EffectiveTranscoding(ctx, ms.ds, format); !ok || TranscodingGeneration(snapshot) != generation {
++		// The decision's snapshot is no longer the committed one. Refuse the
++		// launch: running the new command would violate the snapshot and a
++		// failed lookup can never serve this playback.
++		log.Warn(ctx, "Transcoding configuration changed since the playback decision; refusing stale snapshot",
++			"id", mf.ID, "format", format, "generation", generation)
++		return nil, ErrTranscodeConfigChanged
++	}
++
+ 	job := &streamJob{
+ 		ms:         ms,
+ 		mf:         mf,
+@@ -108,6 +134,7 @@ func (ms *mediaStreamer) NewStream(ctx context.Context, mf *model.MediaFile, req
+ 		bitDepth:   req.BitDepth,
+ 		channels:   req.Channels,
+ 		offset:     req.Offset,
++		generation: generation,
+ 	}
+ 	r, err := ms.cache.Get(ctx, job)
+ 	if err != nil {
+@@ -213,23 +240,45 @@ var (
+ 	instanceTranscodingCache TranscodingCache
+ )
+ 
+-func GetTranscodingCache() TranscodingCache {
++// GetTranscodingCache returns the process-wide transcoding cache. The data
++// store is used on startup to adopt only complete entries whose configuration
++// generation is still committed; see CurrentTranscodingGenerations.
++func GetTranscodingCache(ds model.DataStore) TranscodingCache {
+ 	onceTranscodingCache.Do(func() {
+-		instanceTranscodingCache = NewTranscodingCache()
++		instanceTranscodingCache = NewTranscodingCache(
++			cache.WithCompletionPayload(func(item cache.Item) string {
++				return item.(*streamJob).generation
++			}),
++			cache.WithAdoptionPolicy(func(ctx context.Context) (map[string]struct{}, error) {
++				return CurrentTranscodingGenerations(ctx, ds)
++			}),
++		)
+ 	})
+ 	return instanceTranscodingCache
+ }
+ 
+-func NewTranscodingCache() TranscodingCache {
++func NewTranscodingCache(opts ...cache.Option) TranscodingCache {
+ 	return cache.NewFileCache("Transcoding", conf.Server.TranscodingCacheSize,
+ 		consts.TranscodingCacheDir, consts.DefaultTranscodingCacheMaxItems,
+ 		func(ctx context.Context, arg cache.Item) (io.Reader, error) {
+ 			job := arg.(*streamJob)
+-			command := LookupTranscodeCommand(ctx, job.ms.ds, job.format)
+-			if command == "" {
++			// Authoritative launch-time boundary: run the exact committed
++			// snapshot the playback was pinned to. If the configuration moved
++			// on since the decision, refuse instead of writing the output of a
++			// different command into this generation's namespace.
++			snapshot, ok := EffectiveTranscoding(ctx, job.ms.ds, job.format)
++			if !ok {
+ 				log.Error(ctx, "No transcoding command available", "format", job.format)
+ 				return nil, os.ErrInvalid
+ 			}
++			commandGeneration := TranscodingGeneration(snapshot)
++			if job.generation != "" && commandGeneration != job.generation {
++				log.Warn(ctx, "Refusing to launch transcoder with a different generation than the decision",
++					"id", job.mf.ID, "format", job.format,
++					"decisionGeneration", job.generation, "currentGeneration", commandGeneration)
++				return nil, ErrTranscodeConfigChanged
++			}
++			command := snapshot.Command
+ 
+ 			release, err := job.ms.limiter.Acquire(ctx, limiterKey(ctx))
+ 			if err != nil {
+diff --git a/core/stream/media_streamer_test.go b/core/stream/media_streamer_test.go
+index 5a4bcd480..93e5d2e2c 100644
+--- a/core/stream/media_streamer_test.go
++++ b/core/stream/media_streamer_test.go
+@@ -145,6 +145,87 @@ var _ = Describe("MediaStreamer", func() {
+ 			Expect(err).To(BeNil())
+ 			Expect(s.Seekable()).To(BeTrue())
+ 		})
++
++		Describe("configuration generations", func() {
++			// Builds an isolated stack (own cache, own ffmpeg) for a custom mp3
++			// command so generations are fully under test control.
++			newStack := func(command string, ff *tests.MockFFmpeg) (stream.MediaStreamer, stream.TranscodingCache, *tests.MockTranscodingRepo, model.DataStore) {
++				trcRepo := &tests.MockTranscodingRepo{Data: map[string]*model.Transcoding{
++					"mp3": {ID: "mp3-x", Name: "custom mp3", TargetFormat: "mp3", DefaultBitRate: 192, Command: command},
++				}}
++				localDS := &tests.MockDataStore{MockedTranscoding: trcRepo}
++				localDS.MediaFile().(*tests.MockMediaFileRepo).SetData(model.MediaFiles{
++					{ID: "123", Path: "tests/fixtures/test.mp3", Suffix: "mp3", BitRate: 128, Duration: 257.0},
++				})
++				c := stream.NewTranscodingCache()
++				Eventually(func() bool { return c.Available(context.TODO()) }, 10*time.Second).Should(BeTrue())
++				return stream.NewMediaStreamer(localDS, ff, c), c, trcRepo, localDS
++			}
++
++			It("never serves the old generation's cache after the command changes", func() {
++				s1, sharedCache, repo, ds1 := newStack("ffmpeg -command v1", tests.NewMockFFmpeg("gen1-data"))
++				gen1, ok := stream.EffectiveGeneration(ctx, ds1, "mp3")
++				Expect(ok).To(BeTrue())
++
++				// First generation: transcode and fully populate the cache.
++				r1, err := s1.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 32, Generation: gen1})
++				Expect(err).ToNot(HaveOccurred())
++				Expect(r1.Seekable()).To(BeFalse()) // cache MISS
++				data1, err := io.ReadAll(r1)
++				Expect(err).ToNot(HaveOccurred())
++				Expect(string(data1)).To(Equal("gen1-data"))
++				_ = r1.Close()
++
++				// Admin commits a new command.
++				repo.Data["mp3"].Command = "ffmpeg -command v2"
++				gen2, ok := stream.EffectiveGeneration(ctx, ds1, "mp3")
++				Expect(ok).To(BeTrue())
++				Expect(gen2).NotTo(Equal(gen1))
++
++				// A second streamer, same on-disk cache, new ffmpeg output.
++				s2 := stream.NewMediaStreamer(ds1, tests.NewMockFFmpeg("gen2-data"), sharedCache)
++
++				// The new generation must be a MISS, never the old complete entry.
++				r2, err := s2.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 32, Generation: gen2})
++				Expect(err).ToNot(HaveOccurred())
++				Expect(r2.Seekable()).To(BeFalse(), "changed generation must not hit the pre-change cache")
++				data2, err := io.ReadAll(r2)
++				Expect(err).ToNot(HaveOccurred())
++				Expect(string(data2)).To(Equal("gen2-data"), "new generation output must never come from the old cache")
++				_ = r2.Close()
++
++				// Once complete, the new generation hits its own namespace.
++				Eventually(func() bool {
++					r3, err := s2.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 32, Generation: gen2})
++					if err != nil {
++						return false
++					}
++					defer r3.Close()
++					return r3.Seekable()
++				}, "3s").Should(BeTrue())
++
++				// A request still pinned to the old committed snapshot is
++				// refused instead of launching v2 under the v1 generation.
++				_, err = s2.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 32, Generation: gen1})
++				Expect(err).To(MatchError(stream.ErrTranscodeConfigChanged))
++			})
++
++			It("keeps cache hits stable for an unchanged configuration", func() {
++				s, _, _, localDS := newStack("ffmpeg -stable", tests.NewMockFFmpeg("stable-data"))
++				gen, ok := stream.EffectiveGeneration(ctx, localDS, "mp3")
++				Expect(ok).To(BeTrue())
++
++				r1, err := s.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 64, Generation: gen})
++				Expect(err).ToNot(HaveOccurred())
++				_, _ = io.ReadAll(r1)
++				_ = r1.Close()
++
++				r2, err := s.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 64, Generation: gen})
++				Expect(err).ToNot(HaveOccurred())
++				Expect(r2.Seekable()).To(BeTrue(), "unchanged generation must keep hitting its cache")
++				_ = r2.Close()
++			})
++		})
+ 	})
+ 
+ 	Context("Serve", func() {
+diff --git a/core/stream/token.go b/core/stream/token.go
+index 21a26ca93..3d83e656c 100644
+--- a/core/stream/token.go
++++ b/core/stream/token.go
+@@ -24,6 +24,7 @@ type params struct {
+ 	TargetChannels   int
+ 	TargetSampleRate int
+ 	TargetBitDepth   int
++	TargetGeneration string
+ 	SourceUpdatedAt  time.Time
+ }
+ 
+@@ -52,6 +53,12 @@ func (d *TranscodeDecision) toClaimsMap() map[string]any {
+ 		if d.TargetBitDepth != 0 {
+ 			m["bd"] = d.TargetBitDepth
+ 		}
++		// The generation is part of the signed snapshot: a later stream
++		// request must run the exact committed configuration the decision was
++		// taken against, not whatever an admin changed in the meantime.
++		if d.TargetGeneration != "" {
++			m["g"] = d.TargetGeneration
++		}
+ 	}
+ 	return m
+ }
+@@ -85,6 +92,10 @@ func paramsFromToken(token jwt.Token) (*params, error) {
+ 	if err := token.Get("f", &f); err == nil {
+ 		p.TargetFormat = f
+ 	}
++	var g string
++	if err := token.Get("g", &g); err == nil {
++		p.TargetGeneration = g
++	}
+ 	p.TargetBitrate = getIntClaim(token, "b")
+ 	p.TargetChannels = getIntClaim(token, "ch")
+ 	p.TargetSampleRate = getIntClaim(token, "sr")
+@@ -131,11 +142,27 @@ func (s *deciderService) ResolveRequestFromToken(ctx context.Context, token stri
+ 
+ 	req := Request{Offset: offset}
+ 	if !p.DirectPlay && p.TargetFormat != "" {
++		if p.TargetGeneration == "" {
++			// The token predates generation snapshots (or a new server issued
++			// against a decision that could not pin a command). It cannot be
++			// proven to match a committed configuration, so the client must
++			// re-negotiate instead of risking audio from a superseded profile.
++			log.Info(ctx, "Transcode token carries no configuration generation", "mediaID", mf.ID,
++				"format", p.TargetFormat)
++			return Request{}, ErrTokenStale
++		}
++		snapshot, ok := EffectiveTranscoding(ctx, s.ds, p.TargetFormat)
++		if !ok || TranscodingGeneration(snapshot) != p.TargetGeneration {
++			log.Info(ctx, "Transcode token generation is no longer committed", "mediaID", mf.ID,
++				"format", p.TargetFormat, "tokenGeneration", p.TargetGeneration)
++			return Request{}, ErrTokenStale
++		}
+ 		req.Format = p.TargetFormat
+ 		req.BitRate = p.TargetBitrate
+ 		req.SampleRate = p.TargetSampleRate
+ 		req.BitDepth = p.TargetBitDepth
+ 		req.Channels = p.TargetChannels
++		req.Generation = p.TargetGeneration
+ 	}
+ 	return req, nil
+ }
+diff --git a/core/stream/token_test.go b/core/stream/token_test.go
+index 4f0d8066c..a8751f8d0 100644
+--- a/core/stream/token_test.go
++++ b/core/stream/token_test.go
+@@ -242,6 +242,64 @@ var _ = Describe("Token", func() {
+ 			_, err = svc.ResolveRequestFromToken(ctx, tokenStr, mf, 0)
+ 			Expect(err).To(MatchError(ErrTokenInvalid))
+ 		})
++
++		It("pins the transcoding generation into the resolved stream request", func() {
++			generation, ok := EffectiveGeneration(ctx, ds, "mp3")
++			Expect(ok).To(BeTrue())
++			decision := &TranscodeDecision{
++				MediaID:          "song-1",
++				CanTranscode:     true,
++				TargetFormat:     "mp3",
++				TargetBitrate:    192,
++				TargetGeneration: generation,
++				SourceUpdatedAt:  sourceTime,
++			}
++			token, err := svc.CreateTranscodeParams(decision)
++			Expect(err).ToNot(HaveOccurred())
++
++			mf := &model.MediaFile{ID: "song-1", UpdatedAt: sourceTime}
++			req, err := svc.ResolveRequestFromToken(ctx, token, mf, 0)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(req.Format).To(Equal("mp3"))
++			Expect(req.Generation).To(Equal(generation))
++		})
++
++		It("returns ErrTokenStale when the pinned generation is no longer committed", func() {
++			generation, ok := EffectiveGeneration(ctx, ds, "mp3")
++			Expect(ok).To(BeTrue())
++			token, err := svc.CreateTranscodeParams(&TranscodeDecision{
++				MediaID:          "song-1",
++				CanTranscode:     true,
++				TargetFormat:     "mp3",
++				TargetBitrate:    192,
++				TargetGeneration: generation,
++				SourceUpdatedAt:  sourceTime,
++			})
++			Expect(err).ToNot(HaveOccurred())
++
++			// Admin changes the mp3 command after the decision was issued.
++			ds.MockedTranscoding = &tests.MockTranscodingRepo{Data: map[string]*model.Transcoding{
++				"mp3": {ID: "mp31", TargetFormat: "mp3", DefaultBitRate: 192, Command: "ffmpeg -brand-new-command -f mp3 -"},
++			}}
++
++			mf := &model.MediaFile{ID: "song-1", UpdatedAt: sourceTime}
++			_, err = svc.ResolveRequestFromToken(ctx, token, mf, 0)
++			Expect(err).To(MatchError(ErrTokenStale))
++		})
++
++		It("returns ErrTokenStale for a transcode token without a generation claim", func() {
++			token, err := auth.EncodeToken(map[string]any{
++				"mid": "song-1",
++				"ua":  sourceTime.Unix(),
++				"f":   "mp3",
++				"b":   192,
++			})
++			Expect(err).ToNot(HaveOccurred())
++
++			mf := &model.MediaFile{ID: "song-1", UpdatedAt: sourceTime}
++			_, err = svc.ResolveRequestFromToken(ctx, token, mf, 0)
++			Expect(err).To(MatchError(ErrTokenStale))
++		})
+ 	})
+ 
+ 	Describe("paramsFromToken", func() {
+diff --git a/core/stream/types.go b/core/stream/types.go
+index 300017c01..9b28c57eb 100644
+--- a/core/stream/types.go
++++ b/core/stream/types.go
+@@ -9,6 +9,13 @@ import (
+ var (
+ 	ErrTokenInvalid = errors.New("invalid or expired transcode token")
+ 	ErrTokenStale   = errors.New("transcode token is stale: media file has changed")
++	// ErrTranscodeConfigChanged is returned when a playback pinned to a
++	// transcoding generation would have to launch a different (newer or
++	// deleted) configuration than the one its decision snapshot was taken
++	// against. The caller must re-run the decision instead of being served
++	// mismatched audio, and the stale result must not populate the new
++	// generation's cache namespace.
++	ErrTranscodeConfigChanged = errors.New("transcoding configuration changed since the playback decision was made")
+ )
+ 
+ // TranscodeOptions controls optional behavior of MakeTranscodeDecision.
+@@ -26,6 +33,10 @@ type Request struct {
+ 	BitDepth   int
+ 	Channels   int
+ 	Offset     int // seconds
++	// Generation pins the committed transcoding configuration the decision was
++	// taken against. The ffmpeg command and the cache namespace are both bound
++	// to it, so a single playback never mixes snapshots. Empty for raw streams.
++	Generation string
+ }
+ 
+ // ClientInfo represents client playback capabilities.
+@@ -178,6 +189,10 @@ type TranscodeDecision struct {
+ 	TargetChannels   int
+ 	TargetSampleRate int
+ 	TargetBitDepth   int
++	// TargetGeneration identifies the committed transcoding configuration the
++	// decision resolved to. It is carried into the playback token so the later
++	// stream request runs the exact same snapshot.
++	TargetGeneration string
+ 	SourceStream     Details
+ 	SourceUpdatedAt  time.Time
+ 	TranscodeStream  *Details
+diff --git a/model/transcoding.go b/model/transcoding.go
+index da5e09e91..b2a00467b 100644
+--- a/model/transcoding.go
++++ b/model/transcoding.go
+@@ -23,4 +23,11 @@ type TranscodingRepository interface {
+ 	CountAll(ctx context.Context, options ...QueryOptions) (int64, error)
+ 	Put(ctx context.Context, t *Transcoding) error
+ 	FindByFormat(ctx context.Context, format string) (*Transcoding, error)
++	// All returns every transcoding row, including the Command field,
++	// regardless of the caller's privileges. It exists for server-side
++	// configuration resolution (transcoding generation snapshots), not for
++	// REST responses.
++	All(ctx context.Context) (Transcodings, error)
++	// CountPlayers returns how many players reference the given transcoding.
++	CountPlayers(ctx context.Context, transcodingID string) (int64, error)
+ }
+diff --git a/persistence/transcoding_repository.go b/persistence/transcoding_repository.go
+index 9db56e143..890515ce2 100644
+--- a/persistence/transcoding_repository.go
++++ b/persistence/transcoding_repository.go
+@@ -2,6 +2,7 @@ package persistence
+ 
+ import (
+ 	"context"
++	"fmt"
+ 
+ 	. "github.com/Masterminds/squirrel"
+ 	"github.com/deluan/rest"
+@@ -31,6 +32,27 @@ func (r *transcodingRepository) CountAll(ctx context.Context, qo ...model.QueryO
+ 	return r.count(ctx, Select(), qo...)
+ }
+ 
++// All returns every transcoding row with its Command field intact. It is a
++// server-side lookup, so it is not subject to the REST command redaction.
++func (r *transcodingRepository) All(ctx context.Context) (model.Transcodings, error) {
++	sel := r.newSelect(ctx).Columns("*")
++	res := model.Transcodings{}
++	err := r.queryAll(ctx, sel, &res)
++	return res, err
++}
++
++// CountPlayers returns how many players are pinned to the transcoding.
++func (r *transcodingRepository) CountPlayers(ctx context.Context, transcodingID string) (int64, error) {
++	sel := Select("count(*) as count").From("player").Where(Eq{"transcoding_id": transcodingID})
++	var res struct {
++		Count int64
++	}
++	if err := r.queryOne(ctx, sel, &res); err != nil {
++		return 0, err
++	}
++	return res.Count, nil
++}
++
+ func (r *transcodingRepository) FindByFormat(ctx context.Context, format string) (*model.Transcoding, error) {
+ 	sel := r.newSelect(ctx).Columns("*").Where(Eq{"target_format": format})
+ 	var res model.Transcoding
+@@ -97,6 +119,21 @@ func (r *transcodingRepository) Delete(ctx context.Context, ids ...string) error
+ 	if !loggedUser(ctx).IsAdmin {
+ 		return rest.ErrPermissionDenied
+ 	}
++	// Commit boundary: verify every referenced id up front, so a batch delete
++	// is all-or-nothing and a profile still pinned to a player is rejected
++	// deterministically at admin time instead of leaving dangling player
++	// references that later fail playback at random.
++	for _, id := range ids {
++		players, err := r.CountPlayers(ctx, id)
++		if err != nil {
++			return err
++		}
++		if players > 0 {
++			return &rest.ValidationError{Errors: map[string]string{
++				"id": fmt.Sprintf("cannot delete transcoding in use by %d player(s); reassign those players first", players),
++			}}
++		}
++	}
+ 	for _, id := range ids {
+ 		if err := r.deleteByID(ctx, id); err != nil {
+ 			return err
+diff --git a/persistence/transcoding_repository_test.go b/persistence/transcoding_repository_test.go
+index 372b5801f..24ce4d7c9 100644
+--- a/persistence/transcoding_repository_test.go
++++ b/persistence/transcoding_repository_test.go
+@@ -2,6 +2,7 @@ package persistence
+ 
+ import (
+ 	"context"
++	"errors"
+ 
+ 	"github.com/deluan/rest"
+ 	"github.com/navidrome/navidrome/log"
+@@ -68,6 +69,71 @@ var _ = Describe("TranscodingRepository", func() {
+ 			Expect(err).To(MatchError(model.ErrNotFound))
+ 		})
+ 
++		It("refuses to delete a transcoding still referenced by a player", func() {
++			trcID := "in-use"
++			Expect(repo.Put(adminCtx, &model.Transcoding{ID: trcID, Name: "in-use", TargetFormat: "test_format", DefaultBitRate: 256, Command: "ffmpeg"})).To(Succeed())
++
++			players := NewPlayerRepository(GetDBXBuilder())
++			plr := &model.Player{ID: "player-using-trc", Name: "P", Client: "client-x", UserId: adminUser.ID, TranscodingId: trcID}
++			Expect(players.Put(adminCtx, plr)).To(Succeed())
++			DeferCleanup(func() { _ = players.Delete(adminCtx, plr.ID) })
++
++			err := repo.Delete(adminCtx, trcID)
++			var verr *rest.ValidationError
++			Expect(errors.As(err, &verr)).To(BeTrue())
++
++			// The profile is still committed and the reference stays intact.
++			res, getErr := repo.Get(adminCtx, trcID)
++			Expect(getErr).ToNot(HaveOccurred())
++			Expect(res.ID).To(Equal(trcID))
++			stored, pErr := players.Get(adminCtx, plr.ID)
++			Expect(pErr).ToNot(HaveOccurred())
++			Expect(stored.TranscodingId).To(Equal(trcID))
++
++			// Once no player references it, the same delete succeeds.
++			stored.TranscodingId = ""
++			Expect(players.Put(adminCtx, stored)).To(Succeed())
++			Expect(repo.Delete(adminCtx, trcID)).To(Succeed())
++		})
++
++		It("does not delete anything when one id of a batch is still referenced", func() {
++			Expect(repo.Put(adminCtx, &model.Transcoding{ID: "batch-a", Name: "a", TargetFormat: "test_format", DefaultBitRate: 64, Command: "ffmpeg"})).To(Succeed())
++			Expect(repo.Put(adminCtx, &model.Transcoding{ID: "batch-b", Name: "b", TargetFormat: "test_format_b", DefaultBitRate: 64, Command: "ffmpeg"})).To(Succeed())
++			players := NewPlayerRepository(GetDBXBuilder())
++			plr := &model.Player{ID: "player-batch", Name: "P", Client: "client-b", UserId: adminUser.ID, TranscodingId: "batch-b"}
++			Expect(players.Put(adminCtx, plr)).To(Succeed())
++			DeferCleanup(func() {
++				_ = players.Delete(adminCtx, plr.ID)
++				_ = repo.Delete(adminCtx, "batch-a", "batch-b")
++			})
++
++			err := repo.Delete(adminCtx, "batch-a", "batch-b")
++			var verr *rest.ValidationError
++			Expect(errors.As(err, &verr)).To(BeTrue())
++
++			// All-or-nothing: the unreferenced id in the same batch survives too.
++			_, err = repo.Get(adminCtx, "batch-a")
++			Expect(err).ToNot(HaveOccurred())
++			_, err = repo.Get(adminCtx, "batch-b")
++			Expect(err).ToNot(HaveOccurred())
++		})
++
++		It("returns every row with its command via All regardless of privileges", func() {
++			Expect(repo.Put(adminCtx, &model.Transcoding{ID: "allread", Name: "temp", TargetFormat: "test_format", DefaultBitRate: 64, Command: "ffmpeg -secret"})).To(Succeed())
++			for _, c := range []context.Context{ctx, adminCtx} {
++				list, err := repo.All(c)
++				Expect(err).ToNot(HaveOccurred())
++				var found *model.Transcoding
++				for i := range list {
++					if list[i].ID == "allread" {
++						found = &list[i]
++					}
++				}
++				Expect(found).ToNot(BeNil())
++				Expect(found.Command).To(Equal("ffmpeg -secret"))
++			}
++		})
++
+ 		It("reads the Command field via the REST Read method", func() {
+ 			tr := &model.Transcoding{ID: "adminread", Name: "temp", TargetFormat: "test_format", DefaultBitRate: 64, Command: "ffmpeg -secret"}
+ 			Expect(repo.Put(adminCtx, tr)).To(Succeed())
+diff --git a/server/public/handle_streams_test.go b/server/public/handle_streams_test.go
+index 965bc7e05..e722e91ac 100644
+--- a/server/public/handle_streams_test.go
++++ b/server/public/handle_streams_test.go
+@@ -162,7 +162,11 @@ var _ = Describe("handleStream", func() {
+ 		token, _ := auth.CreateExpiringPublicToken(time.Now().Add(time.Hour), claims)
+ 		makeRequest(token)
+ 
+-		Expect(streamer.req).To(Equal(stream.Request{Format: "opus", BitRate: 128, SampleRate: 48000, Channels: 2}))
++		Expect(streamer.req.Format).To(Equal("opus"))
++		Expect(streamer.req.BitRate).To(Equal(128))
++		Expect(streamer.req.SampleRate).To(Equal(48000))
++		Expect(streamer.req.Channels).To(Equal(2))
++		Expect(streamer.req.Generation).ToNot(BeEmpty(), "the share playback must be pinned to a committed generation")
+ 	})
+ 
+ 	It("returns 404 when the track is outside the share owner's libraries", func() {
+diff --git a/tests/mock_transcoding_repo.go b/tests/mock_transcoding_repo.go
+index 52eb16eed..59a4512bf 100644
+--- a/tests/mock_transcoding_repo.go
++++ b/tests/mock_transcoding_repo.go
+@@ -8,13 +8,43 @@ import (
+ 
+ type MockTranscodingRepo struct {
+ 	model.TranscodingRepository
++	// Error, when set, is returned by every lookup.
++	Error error
++	// Data optionally overrides the built-in canned rows. Keys are target
++	// formats; nil Data keeps the historical canned responses.
++	Data map[string]*model.Transcoding
++	// ByID optionally overrides Get lookups by transcoding id.
++	ByID map[string]*model.Transcoding
++	// Players counts references reported by CountPlayers. When nil, zero is
++	// returned for every id.
++	Players map[string]int64
+ }
+ 
+ func (m *MockTranscodingRepo) Get(_ context.Context, id string) (*model.Transcoding, error) {
++	if m.Error != nil {
++		return nil, m.Error
++	}
++	if m.ByID != nil {
++		if t, ok := m.ByID[id]; ok {
++			cp := *t
++			return &cp, nil
++		}
++		return nil, model.ErrNotFound
++	}
+ 	return &model.Transcoding{ID: id, TargetFormat: "mp3", DefaultBitRate: 160}, nil
+ }
+ 
+ func (m *MockTranscodingRepo) FindByFormat(_ context.Context, format string) (*model.Transcoding, error) {
++	if m.Error != nil {
++		return nil, m.Error
++	}
++	if m.Data != nil {
++		if t, ok := m.Data[format]; ok {
++			cp := *t
++			return &cp, nil
++		}
++		return nil, model.ErrNotFound
++	}
+ 	switch format {
+ 	case "mp3":
+ 		return &model.Transcoding{ID: "mp31", TargetFormat: "mp3", DefaultBitRate: 160}, nil
+@@ -30,3 +60,30 @@ func (m *MockTranscodingRepo) FindByFormat(_ context.Context, format string) (*m
+ 		return nil, model.ErrNotFound
+ 	}
+ }
++
++// All returns every configured row with its Command field intact.
++func (m *MockTranscodingRepo) All(_ context.Context) (model.Transcodings, error) {
++	if m.Error != nil {
++		return nil, m.Error
++	}
++	if m.Data != nil {
++		res := make(model.Transcodings, 0, len(m.Data))
++		for _, t := range m.Data {
++			res = append(res, *t)
++		}
++		return res, nil
++	}
++	return model.Transcodings{
++		{ID: "mp31", TargetFormat: "mp3", DefaultBitRate: 160},
++		{ID: "opus1", TargetFormat: "opus", DefaultBitRate: 96},
++		{ID: "flac1", TargetFormat: "flac", DefaultBitRate: 0, Command: "ffmpeg -ss %t -i %s -map 0:a:0 -v 0 -c:a flac -f flac -"},
++		{ID: "aac1", TargetFormat: "aac", DefaultBitRate: 256, Command: "ffmpeg -ss %t -i %s -map 0:a:0 -b:a %bk -v 0 -c:a aac -f ipod -movflags frag_keyframe+empty_moov -"},
++	}, nil
++}
++
++func (m *MockTranscodingRepo) CountPlayers(_ context.Context, transcodingID string) (int64, error) {
++	if m.Error != nil {
++		return 0, m.Error
++	}
++	return m.Players[transcodingID], nil
++}
+diff --git a/utils/cache/file_caches.go b/utils/cache/file_caches.go
+index 48cd135cb..b89102ad6 100644
+--- a/utils/cache/file_caches.go
++++ b/utils/cache/file_caches.go
+@@ -61,6 +61,47 @@ type FileCache interface {
+ 	Disabled(ctx context.Context) bool
+ }
+ 
++// AdoptionDecision tells the startup scan what to do with an entry found on disk.
++type AdoptionDecision int
++
++const (
++	// AdoptCurrent loads the entry into the cache and keeps its data file.
++	AdoptCurrent AdoptionDecision = iota
++	// PruneEntry deletes the data file and its completion marker. The entry
++	// cannot be proven to belong to a currently committed snapshot (e.g. it
++	// was produced by a superseded configuration generation).
++	PruneEntry
++	// RetainEntry skips adoption but keeps the file on disk, so it is
++	// reconsidered on the next startup. Used when eligibility cannot be
++	// decided yet (e.g. a transient store error); the entry is never served.
++	RetainEntry
++)
++
++// Option customizes a FileCache created with NewFileCache.
++type Option func(*fileCache)
++
++// WithCompletionPayload stores payload in every successfully written entry's
++// completion marker. Together with WithAdoptionPolicy it lets a restart tell
++// committed-snapshot entries apart from stale ones. The payload doubles as the
++// adoption key, so it should be short and stable (e.g. a content hash).
++func WithCompletionPayload(payload func(item Item) string) Option {
++	return func(fc *fileCache) {
++		fc.completionPayload = payload
++	}
++}
++
++// WithAdoptionPolicy gates which on-disk entries are restored on startup. The
++// loader returns the set of payloads (as recorded by WithCompletionPayload)
++// currently eligible for adoption; it is evaluated once per startup. Entries
++// whose payload is not in the set are pruned; a loader error retains them on
++// disk without adopting, so a transient store failure can neither serve stale
++// data nor destroy entries that might still be valid.
++func WithAdoptionPolicy(loader func(ctx context.Context) (map[string]struct{}, error)) Option {
++	return func(fc *fileCache) {
++		fc.adoptionLoader = loader
++	}
++}
++
+ // NewFileCache creates a new FileCache. This function initializes the cache and starts it in the background.
+ //
+ //	name: A string representing the name of the cache.
+@@ -75,7 +116,7 @@ type FileCache interface {
+ //	    // Implement the logic to retrieve the data for the given item
+ //	    return strings.NewReader(item.Key()), nil
+ //	})
+-func NewFileCache(name, cacheSize, cacheFolder string, maxItems int, getReader ReadFunc) FileCache {
++func NewFileCache(name, cacheSize, cacheFolder string, maxItems int, getReader ReadFunc, opts ...Option) FileCache {
+ 	fc := &fileCache{
+ 		name:        name,
+ 		cacheSize:   cacheSize,
+@@ -84,10 +125,13 @@ func NewFileCache(name, cacheSize, cacheFolder string, maxItems int, getReader R
+ 		getReader:   getReader,
+ 		mutex:       &sync.RWMutex{},
+ 	}
++	for _, opt := range opts {
++		opt(fc)
++	}
+ 
+ 	go func() {
+ 		start := time.Now()
+-		cache, sfs, err := newFSCache(fc.name, fc.cacheSize, fc.cacheFolder, fc.maxItems)
++		cache, sfs, err := newFSCache(fc.name, fc.cacheSize, fc.cacheFolder, fc.maxItems, fc.adoptionGate())
+ 		fc.mutex.Lock()
+ 		defer fc.mutex.Unlock()
+ 		fc.cache = cache
+@@ -107,16 +151,56 @@ func NewFileCache(name, cacheSize, cacheFolder string, maxItems int, getReader R
+ }
+ 
+ type fileCache struct {
+-	name        string
+-	cacheSize   string
+-	cacheFolder string
+-	maxItems    int
+-	cache       fscache.Cache
+-	fs          *spreadFS
+-	getReader   ReadFunc
+-	disabled    bool
+-	ready       atomic.Bool
+-	mutex       *sync.RWMutex
++	name              string
++	cacheSize         string
++	cacheFolder       string
++	maxItems          int
++	cache             fscache.Cache
++	fs                *spreadFS
++	getReader         ReadFunc
++	completionPayload func(item Item) string
++	adoptionLoader    func(ctx context.Context) (map[string]struct{}, error)
++	disabled          bool
++	ready             atomic.Bool
++	mutex             *sync.RWMutex
++}
++
++// adoptionGate builds the per-startup payload predicate for the spread FS. It
++// returns nil when no policy was configured, which keeps the default
++// "adopt every complete entry" behavior.
++func (fc *fileCache) adoptionGate() func(payload string) AdoptionDecision {
++	if fc.adoptionLoader == nil {
++		return nil
++	}
++	gate := &adoptionGate{load: fc.adoptionLoader}
++	return gate.decide
++}
++
++// adoptionGate resolves the eligible payload set lazily, exactly once per
++// startup, while the filesystem scan walks the cache directory.
++type adoptionGate struct {
++	once  sync.Once
++	valid map[string]struct{}
++	err   error
++	load  func(ctx context.Context) (map[string]struct{}, error)
++}
++
++func (g *adoptionGate) decide(payload string) AdoptionDecision {
++	g.once.Do(func() {
++		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
++		defer cancel()
++		g.valid, g.err = g.load(ctx)
++	})
++	if g.err != nil {
++		// Eligibility is unknown: do not serve the entry, but keep its bytes so
++		// a later startup can re-evaluate once the store is reachable again.
++		log.Warn("Could not determine committed cache generations; skipping adoption for this startup", g.err)
++		return RetainEntry
++	}
++	if _, ok := g.valid[payload]; ok {
++		return AdoptCurrent
++	}
++	return PruneEntry
+ }
+ 
+ func (fc *fileCache) Available(_ context.Context) bool {
+@@ -182,8 +266,12 @@ func (fc *fileCache) Get(ctx context.Context, arg Item) (*CachedStream, error) {
+ 			_ = fc.invalidate(ctx, key)
+ 			return nil, err
+ 		}
++		payload := ""
++		if fc.completionPayload != nil {
++			payload = fc.completionPayload(arg)
++		}
+ 		go func() {
+-			if err := fc.copyAndClose(ctx, key, w, reader); err != nil {
++			if err := fc.copyAndClose(ctx, key, w, reader, payload); err != nil {
+ 				log.Debug(ctx, "Error storing file in cache", "cache", fc.name, "key", key, err)
+ 				_ = fc.invalidate(ctx, key)
+ 			} else {
+@@ -242,8 +330,9 @@ func getFinalCachedSize(r fscache.ReadAtCloser) int64 {
+ 	return -1
+ }
+ 
+-// copyAndClose marks the entry complete before closing w, so EOF implies the entry is settled on disk.
+-func (fc *fileCache) copyAndClose(ctx context.Context, key string, w io.WriteCloser, r io.Reader) error {
++// copyAndClose marks the entry complete (recording its generation payload)
++// before closing w, so EOF implies the entry is settled on disk.
++func (fc *fileCache) copyAndClose(ctx context.Context, key string, w io.WriteCloser, r io.Reader, payload string) error {
+ 	_, err := io.Copy(w, r)
+ 	if err != nil {
+ 		err = fmt.Errorf("copying data to cache: %w", err)
+@@ -254,7 +343,7 @@ func (fc *fileCache) copyAndClose(ctx context.Context, key string, w io.WriteClo
+ 		}
+ 	}
+ 	if err == nil {
+-		fc.markComplete(ctx, key)
++		fc.markComplete(ctx, key, payload)
+ 	} else if cw, ok := w.(interface{ CloseWithError(error) error }); ok {
+ 		// Cancel instead of close, so readers fail with the cause rather than
+ 		// draining a truncated entry to a clean EOF.
+@@ -273,18 +362,19 @@ func (fc *fileCache) copyAndClose(ctx context.Context, key string, w io.WriteClo
+ 	return err
+ }
+ 
+-// markComplete records on disk that the entry for key was written in full,
+-// so it is eligible for adoption after a restart (see spreadFS.Reload).
+-func (fc *fileCache) markComplete(ctx context.Context, key string) {
++// markComplete records on disk that the entry for key was written in full and
++// which generation payload it belongs to, so it is eligible for adoption after
++// a restart only when that generation is still committed (see spreadFS.Reload).
++func (fc *fileCache) markComplete(ctx context.Context, key, payload string) {
+ 	if fc.fs == nil {
+ 		return
+ 	}
+-	if err := fc.fs.MarkComplete(key); err != nil {
++	if err := fc.fs.MarkCompleteWith(key, payload); err != nil {
+ 		log.Warn(ctx, "Error writing cache completion marker", "cache", fc.name, "key", key, err)
+ 	}
+ }
+ 
+-func newFSCache(name, cacheSize, cacheFolder string, maxItems int) (fscache.Cache, *spreadFS, error) {
++func newFSCache(name, cacheSize, cacheFolder string, maxItems int, adoption func(payload string) AdoptionDecision) (fscache.Cache, *spreadFS, error) {
+ 	size, err := humanize.ParseBytes(cacheSize)
+ 	if err != nil {
+ 		log.Error("Invalid cache size. Using default size", "cache", name, "size", cacheSize,
+@@ -307,6 +397,10 @@ func newFSCache(name, cacheSize, cacheFolder string, maxItems int) (fscache.Cach
+ 		log.Error(fmt.Sprintf("Error initializing %s cache FS", name), err)
+ 		return nil, nil, err
+ 	}
++	// Must be installed before fscache scans the directory in
++	// NewCacheWithHaunter below, so the very first Reload already filters by
++	// generation instead of briefly adopting stale entries.
++	fs.SetAdoptionPolicy(adoption)
+ 
+ 	ck, err := fscache.NewCacheWithHaunter(fs, h)
+ 	if err != nil {
+diff --git a/utils/cache/file_caches_test.go b/utils/cache/file_caches_test.go
+index 3189de6b2..5817230c4 100644
+--- a/utils/cache/file_caches_test.go
++++ b/utils/cache/file_caches_test.go
+@@ -414,12 +414,119 @@ var _ = Describe("File Caches", func() {
+ 			})
+ 		})
+ 	})
++
++	Describe("generation-gated restart adoption", func() {
++		mkArg := func(generation string) *genArg {
++			return &genArg{key: "song-" + generation, generation: generation}
++		}
++
++		It("records the payload in the completion marker", func() {
++			fc := NewFileCache("genmarker", "10MB", "genmarker", 0, func(_ context.Context, arg Item) (io.Reader, error) {
++				return strings.NewReader("payload"), nil
++			}, WithCompletionPayload(func(arg Item) string {
++				return arg.(*genArg).generation
++			})).(*fileCache)
++			Eventually(func() bool { return fc.ready.Load() }, 10*time.Second).Should(BeTrue())
++
++			s, err := fc.Get(context.Background(), mkArg("g1"))
++			Expect(err).ToNot(HaveOccurred())
++			Expect(io.ReadAll(s)).To(Equal([]byte("payload")))
++			Expect(s.Close()).To(Succeed())
++
++			dataPath := fcSpreadFS(fc).KeyMapper(mkArg("g1").Key())
++			Eventually(func() (string, error) {
++				b, e := os.ReadFile(dataPath + ".complete")
++				return string(b), e
++			}, "3s").Should(Equal("g1"))
++		})
++
++		It("restores only complete entries of committed generations on restart", func() {
++			folder := "genrestart"
++			producer := func(_ context.Context, arg Item) (io.Reader, error) {
++				return strings.NewReader("data-" + arg.(*genArg).generation), nil
++			}
++			payloadOpt := WithCompletionPayload(func(arg Item) string { return arg.(*genArg).generation })
++
++			// First process run: complete one entry per generation.
++			fc1 := NewFileCache("genrun1", "10MB", folder, 0, producer, payloadOpt).(*fileCache)
++			Eventually(func() bool { return fc1.ready.Load() }, 10*time.Second).Should(BeTrue())
++			for _, g := range []string{"g-old", "g-new"} {
++				s, err := fc1.Get(context.Background(), mkArg(g))
++				Expect(err).ToNot(HaveOccurred())
++				Expect(io.ReadAll(s)).To(Equal([]byte("data-" + g)))
++				Expect(s.Close()).To(Succeed())
++			}
++			oldPath := fcSpreadFS(fc1).KeyMapper(mkArg("g-old").Key())
++			newPath := fcSpreadFS(fc1).KeyMapper(mkArg("g-new").Key())
++			Eventually(func() error { _, e := os.Stat(oldPath + ".complete"); return e }, "3s").Should(Succeed())
++			Eventually(func() error { _, e := os.Stat(newPath + ".complete"); return e }, "3s").Should(Succeed())
++
++			// Restart: only g-new is still a committed generation.
++			fc2 := NewFileCache("genrun2", "10MB", folder, 0, producer, payloadOpt,
++				WithAdoptionPolicy(func(_ context.Context) (map[string]struct{}, error) {
++					return map[string]struct{}{"g-new": {}}, nil
++				}),
++			).(*fileCache)
++			Eventually(func() bool { return fc2.ready.Load() }, 10*time.Second).Should(BeTrue())
++
++			// The old generation's complete entry is pruned from disk...
++			Eventually(func() bool {
++				_, e := os.Stat(oldPath)
++				return os.IsNotExist(e)
++			}, "3s").Should(BeTrue())
++			// ...while the current one survives and is served as an adopted HIT.
++			s, err := fc2.Get(context.Background(), mkArg("g-new"))
++			Expect(err).ToNot(HaveOccurred())
++			Expect(s.Cached).To(BeTrue())
++			Expect(io.ReadAll(s)).To(Equal([]byte("data-g-new")))
++			Expect(s.Close()).To(Succeed())
++		})
++
++		It("retains entries without adopting them when the generation loader fails", func() {
++			folder := "genretain"
++			producer := func(_ context.Context, _ Item) (io.Reader, error) {
++				return strings.NewReader("payload"), nil
++			}
++			fc1 := NewFileCache("genret1", "10MB", folder, 0, producer,
++				WithCompletionPayload(func(Item) string { return "g1" })).(*fileCache)
++			Eventually(func() bool { return fc1.ready.Load() }, 10*time.Second).Should(BeTrue())
++			s, err := fc1.Get(context.Background(), mkArg("g1"))
++			Expect(err).ToNot(HaveOccurred())
++			Expect(s.Close()).To(Succeed())
++			dataPath := fcSpreadFS(fc1).KeyMapper(mkArg("g1").Key())
++			Eventually(func() error { _, e := os.Stat(dataPath + ".complete"); return e }, "3s").Should(Succeed())
++
++			fc2 := NewFileCache("genret2", "10MB", folder, 0, producer,
++				WithCompletionPayload(func(Item) string { return "g1" }),
++				WithAdoptionPolicy(func(_ context.Context) (map[string]struct{}, error) {
++					return nil, errors.New("store temporarily unreachable")
++				}),
++			).(*fileCache)
++			Eventually(func() bool { return fc2.ready.Load() }, 10*time.Second).Should(BeTrue())
++
++			// Not adopted: a Get re-fetches (MISS)...
++			s2, err := fc2.Get(context.Background(), mkArg("g1"))
++			Expect(err).ToNot(HaveOccurred())
++			Expect(s2.Cached).To(BeFalse())
++			Expect(s2.Close()).To(Succeed())
++			// ...but the original bytes were never deleted.
++			_, err = os.Stat(dataPath)
++			Expect(err).To(Succeed())
++		})
++	})
+ })
+ 
+ type testArg struct{ s string }
+ 
+ func (t *testArg) Key() string { return t.s }
+ 
++type genArg struct {
++	key        string
++	generation string
++}
++
++func (a *genArg) Key() string { return a.key }
++
+ type errFakeReader struct{ err error }
+ 
+ func (e errFakeReader) Read([]byte) (int, error) { return 0, e.err }
+diff --git a/utils/cache/spread_fs.go b/utils/cache/spread_fs.go
+index 11801b324..00ab78481 100644
+--- a/utils/cache/spread_fs.go
++++ b/utils/cache/spread_fs.go
+@@ -18,9 +18,10 @@ const completeMarkerSuffix = ".complete"
+ const sentinelName = ".nd-migrated"
+ 
+ type spreadFS struct {
+-	root string
+-	mode os.FileMode
+-	init func() error
++	root    string
++	mode    os.FileMode
++	init    func() error
++	adopt   func(payload string) AdoptionDecision
+ }
+ 
+ // NewSpreadFS returns a FileSystem rooted at directory dir. This FS hashes the key and
+@@ -42,6 +43,13 @@ func NewSpreadFS(dir string, mode os.FileMode) (*spreadFS, error) {
+ 	return f, f.init()
+ }
+ 
++// SetAdoptionPolicy installs the gate applied while reloading the cache
++// directory. A nil policy restores the default: every marked entry is adopted.
++// It must be set before the filesystem is scanned on cache construction.
++func (sfs *spreadFS) SetAdoptionPolicy(adopt func(payload string) AdoptionDecision) {
++	sfs.adopt = adopt
++}
++
+ func (sfs *spreadFS) Reload(f func(key string, name string)) error {
+ 	// On the first run after upgrade (no sentinel yet), pre-existing files have
+ 	// no completion marker. Migrate them instead of discarding them as partials,
+@@ -53,7 +61,8 @@ func (sfs *spreadFS) Reload(f func(key string, name string)) error {
+ 
+ 	count := 0
+ 	err := sfs.walkDataFiles(func(absoluteFilePath string) {
+-		if _, statErr := os.Stat(sfs.markerPath(absoluteFilePath)); statErr != nil {
++		marker := sfs.markerPath(absoluteFilePath)
++		if _, statErr := os.Stat(marker); statErr != nil {
+ 			switch {
+ 			case migrating:
+ 				if mErr := sfs.MarkComplete(absoluteFilePath); mErr != nil {
+@@ -70,6 +79,29 @@ func (sfs *spreadFS) Reload(f func(key string, name string)) error {
+ 				log.Warn("Error reading cache completion marker", "file", absoluteFilePath, statErr)
+ 				return
+ 			}
++		} else if sfs.adopt != nil {
++			payload := ""
++			if data, readErr := os.ReadFile(marker); readErr == nil {
++				payload = strings.TrimSpace(string(data))
++			} else if !os.IsNotExist(readErr) {
++				log.Warn("Error reading cache completion marker", "file", absoluteFilePath, readErr)
++				return
++			}
++			switch sfs.adopt(payload) {
++			case PruneEntry:
++				// Belongs to a generation that is no longer committed (or its
++				// lineage cannot be established): never serve it, free the space.
++				log.Debug("Removing cache entry outside committed generations", "file", absoluteFilePath, "payload", payload)
++				if rmErr := sfs.Remove(absoluteFilePath); rmErr != nil {
++					log.Warn("Error pruning stale cache file", "file", absoluteFilePath, rmErr)
++				}
++				return
++			case RetainEntry:
++				// Eligibility undecided this startup: leave the bytes on disk
++				// but do not load them into the cache.
++				return
++			case AdoptCurrent:
++			}
+ 		}
+ 		f(absoluteFilePath, absoluteFilePath)
+ 		count++
+@@ -145,11 +177,36 @@ func (sfs *spreadFS) markerPath(dataPath string) string {
+ // key may be an original cache key or an already-mapped data path; KeyMapper
+ // is idempotent for the latter (see KeyMapper).
+ func (sfs *spreadFS) MarkComplete(key string) error {
+-	f, err := os.OpenFile(sfs.markerPath(sfs.KeyMapper(key)), os.O_CREATE|os.O_WRONLY, 0600)
++	return sfs.MarkCompleteWith(key, "")
++}
++
++// MarkCompleteWith is MarkComplete plus the generation payload recorded in the
++// marker. The payload is written atomically (temp file + rename), so a crash
++// leaves either no marker or a complete marker with the full payload — never a
++// torn one.
++func (sfs *spreadFS) MarkCompleteWith(key, payload string) error {
++	marker := sfs.markerPath(sfs.KeyMapper(key))
++	tmp := marker + ".tmp"
++	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
+ 	if err != nil {
+ 		return err
+ 	}
+-	return f.Close()
++	if _, err = f.WriteString(payload); err != nil {
++		_ = f.Close()
++		_ = os.Remove(tmp)
++		return err
++	}
++	if err = f.Close(); err != nil {
++		_ = os.Remove(tmp)
++		return err
++	}
++	// Rename over an existing marker fails on Windows; a marker is written
++	// exactly once per entry lifetime (Remove deletes it first), so removing a
++	// pre-existing one is only a defensive measure.
++	if _, err = os.Stat(marker); err == nil {
++		_ = os.Remove(marker)
++	}
++	return os.Rename(tmp, marker)
+ }
+ 
+ func (sfs *spreadFS) Remove(name string) error {
+diff --git a/utils/cache/spread_fs_test.go b/utils/cache/spread_fs_test.go
+index d0b54567d..d6f07b808 100644
+--- a/utils/cache/spread_fs_test.go
++++ b/utils/cache/spread_fs_test.go
+@@ -88,6 +88,19 @@ var _ = Describe("Spread FS", func() {
+ 			Expect(statErr).To(BeNil())
+ 		})
+ 
++		It("records the generation payload in the marker", func() {
++			data := fs.KeyMapper("song-gen")
++			f, err := fs.Create(data)
++			Expect(err).To(BeNil())
++			_, _ = f.Write([]byte("ok"))
++			_ = f.Close()
++
++			Expect(fs.MarkCompleteWith(data, "gabc123")).To(Succeed())
++			payload, err := os.ReadFile(data + ".complete")
++			Expect(err).To(BeNil())
++			Expect(string(payload)).To(Equal("gabc123"))
++		})
++
+ 		It("removes the sibling marker when the data file is removed", func() {
+ 			data := fs.KeyMapper("song2")
+ 			f, err := fs.Create(data)
+@@ -104,6 +117,77 @@ var _ = Describe("Spread FS", func() {
+ 		})
+ 	})
+ 
++	Describe("Reload with a generation policy", func() {
++		// After the migration sentinel exists, every marker is evaluated.
++		makeCompleted := func(key, generation string) string {
++			data := fs.KeyMapper(key)
++			f, err := fs.Create(data)
++			Expect(err).To(BeNil())
++			_, _ = f.Write([]byte(key))
++			Expect(f.Close()).To(Succeed())
++			if generation == "" {
++				Expect(fs.MarkComplete(data)).To(Succeed())
++			} else {
++				Expect(fs.MarkCompleteWith(data, generation)).To(Succeed())
++			}
++			return data
++		}
++
++		BeforeEach(func() {
++			Expect(os.WriteFile(filepath.Join(rootDir, ".nd-migrated"), nil, 0600)).To(Succeed())
++		})
++
++		It("adopts only entries whose generation is committed and prunes the rest", func() {
++			current := makeCompleted("current", "g-current")
++			stale := makeCompleted("stale", "g-stale")
++			unknown := makeCompleted("unknown", "")
++
++			fs.SetAdoptionPolicy(func(payload string) AdoptionDecision {
++				if payload == "g-current" {
++					return AdoptCurrent
++				}
++				return PruneEntry
++			})
++
++			var adopted []string
++			Expect(fs.Reload(func(key, name string) { adopted = append(adopted, name) })).To(Succeed())
++			Expect(adopted).To(ConsistOf(current))
++
++			_, err := os.Stat(stale)
++			Expect(os.IsNotExist(err)).To(BeTrue())
++			_, err = os.Stat(stale + ".complete")
++			Expect(os.IsNotExist(err)).To(BeTrue())
++			_, err = os.Stat(unknown)
++			Expect(os.IsNotExist(err)).To(BeTrue())
++		})
++
++		It("retains entries on disk without adopting them when eligibility is undecided", func() {
++			retained := makeCompleted("retained", "g-retained")
++			current := makeCompleted("current", "g-current")
++
++			fs.SetAdoptionPolicy(func(payload string) AdoptionDecision {
++				if payload == "g-retained" {
++					return RetainEntry
++				}
++				return AdoptCurrent
++			})
++
++			var adopted []string
++			Expect(fs.Reload(func(key, name string) { adopted = append(adopted, name) })).To(Succeed())
++			Expect(adopted).To(ConsistOf(current))
++			_, err := os.Stat(retained)
++			Expect(err).To(Succeed(), "retained entries stay on disk for the next startup")
++		})
++
++		It("adopts every marked entry when no policy is installed", func() {
++			a := makeCompleted("a", "g1")
++			b := makeCompleted("b", "g2")
++			var adopted []string
++			Expect(fs.Reload(func(key, name string) { adopted = append(adopted, name) })).To(Succeed())
++			Expect(adopted).To(ConsistOf(a, b))
++		})
++	})
++
+ 	Describe("Reload", func() {
+ 		makeData := func(content string) string {
+ 			file := fs.KeyMapper(content)

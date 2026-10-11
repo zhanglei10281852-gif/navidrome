@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"fmt"
 
 	. "github.com/Masterminds/squirrel"
 	"github.com/deluan/rest"
@@ -29,6 +30,27 @@ func (r *transcodingRepository) Get(ctx context.Context, id string) (*model.Tran
 
 func (r *transcodingRepository) CountAll(ctx context.Context, qo ...model.QueryOptions) (int64, error) {
 	return r.count(ctx, Select(), qo...)
+}
+
+// All returns every transcoding row with its Command field intact. It is a
+// server-side lookup, so it is not subject to the REST command redaction.
+func (r *transcodingRepository) All(ctx context.Context) (model.Transcodings, error) {
+	sel := r.newSelect(ctx).Columns("*")
+	res := model.Transcodings{}
+	err := r.queryAll(ctx, sel, &res)
+	return res, err
+}
+
+// CountPlayers returns how many players are pinned to the transcoding.
+func (r *transcodingRepository) CountPlayers(ctx context.Context, transcodingID string) (int64, error) {
+	sel := Select("count(*) as count").From("player").Where(Eq{"transcoding_id": transcodingID})
+	var res struct {
+		Count int64
+	}
+	if err := r.queryOne(ctx, sel, &res); err != nil {
+		return 0, err
+	}
+	return res.Count, nil
 }
 
 func (r *transcodingRepository) FindByFormat(ctx context.Context, format string) (*model.Transcoding, error) {
@@ -96,6 +118,21 @@ func (r *transcodingRepository) Update(ctx context.Context, id string, entity mo
 func (r *transcodingRepository) Delete(ctx context.Context, ids ...string) error {
 	if !loggedUser(ctx).IsAdmin {
 		return rest.ErrPermissionDenied
+	}
+	// Commit boundary: verify every referenced id up front, so a batch delete
+	// is all-or-nothing and a profile still pinned to a player is rejected
+	// deterministically at admin time instead of leaving dangling player
+	// references that later fail playback at random.
+	for _, id := range ids {
+		players, err := r.CountPlayers(ctx, id)
+		if err != nil {
+			return err
+		}
+		if players > 0 {
+			return &rest.ValidationError{Errors: map[string]string{
+				"id": fmt.Sprintf("cannot delete transcoding in use by %d player(s); reassign those players first", players),
+			}}
+		}
 	}
 	for _, id := range ids {
 		if err := r.deleteByID(ctx, id); err != nil {

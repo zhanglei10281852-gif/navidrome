@@ -414,11 +414,118 @@ var _ = Describe("File Caches", func() {
 			})
 		})
 	})
+
+	Describe("generation-gated restart adoption", func() {
+		mkArg := func(generation string) *genArg {
+			return &genArg{key: "song-" + generation, generation: generation}
+		}
+
+		It("records the payload in the completion marker", func() {
+			fc := NewFileCache("genmarker", "10MB", "genmarker", 0, func(_ context.Context, arg Item) (io.Reader, error) {
+				return strings.NewReader("payload"), nil
+			}, WithCompletionPayload(func(arg Item) string {
+				return arg.(*genArg).generation
+			})).(*fileCache)
+			Eventually(func() bool { return fc.ready.Load() }, 10*time.Second).Should(BeTrue())
+
+			s, err := fc.Get(context.Background(), mkArg("g1"))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(io.ReadAll(s)).To(Equal([]byte("payload")))
+			Expect(s.Close()).To(Succeed())
+
+			dataPath := fcSpreadFS(fc).KeyMapper(mkArg("g1").Key())
+			Eventually(func() (string, error) {
+				b, e := os.ReadFile(dataPath + ".complete")
+				return string(b), e
+			}, "3s").Should(Equal("g1"))
+		})
+
+		It("restores only complete entries of committed generations on restart", func() {
+			folder := "genrestart"
+			producer := func(_ context.Context, arg Item) (io.Reader, error) {
+				return strings.NewReader("data-" + arg.(*genArg).generation), nil
+			}
+			payloadOpt := WithCompletionPayload(func(arg Item) string { return arg.(*genArg).generation })
+
+			// First process run: complete one entry per generation.
+			fc1 := NewFileCache("genrun1", "10MB", folder, 0, producer, payloadOpt).(*fileCache)
+			Eventually(func() bool { return fc1.ready.Load() }, 10*time.Second).Should(BeTrue())
+			for _, g := range []string{"g-old", "g-new"} {
+				s, err := fc1.Get(context.Background(), mkArg(g))
+				Expect(err).ToNot(HaveOccurred())
+				Expect(io.ReadAll(s)).To(Equal([]byte("data-" + g)))
+				Expect(s.Close()).To(Succeed())
+			}
+			oldPath := fcSpreadFS(fc1).KeyMapper(mkArg("g-old").Key())
+			newPath := fcSpreadFS(fc1).KeyMapper(mkArg("g-new").Key())
+			Eventually(func() error { _, e := os.Stat(oldPath + ".complete"); return e }, "3s").Should(Succeed())
+			Eventually(func() error { _, e := os.Stat(newPath + ".complete"); return e }, "3s").Should(Succeed())
+
+			// Restart: only g-new is still a committed generation.
+			fc2 := NewFileCache("genrun2", "10MB", folder, 0, producer, payloadOpt,
+				WithAdoptionPolicy(func(_ context.Context) (map[string]struct{}, error) {
+					return map[string]struct{}{"g-new": {}}, nil
+				}),
+			).(*fileCache)
+			Eventually(func() bool { return fc2.ready.Load() }, 10*time.Second).Should(BeTrue())
+
+			// The old generation's complete entry is pruned from disk...
+			Eventually(func() bool {
+				_, e := os.Stat(oldPath)
+				return os.IsNotExist(e)
+			}, "3s").Should(BeTrue())
+			// ...while the current one survives and is served as an adopted HIT.
+			s, err := fc2.Get(context.Background(), mkArg("g-new"))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(s.Cached).To(BeTrue())
+			Expect(io.ReadAll(s)).To(Equal([]byte("data-g-new")))
+			Expect(s.Close()).To(Succeed())
+		})
+
+		It("retains entries without adopting them when the generation loader fails", func() {
+			folder := "genretain"
+			producer := func(_ context.Context, _ Item) (io.Reader, error) {
+				return strings.NewReader("payload"), nil
+			}
+			fc1 := NewFileCache("genret1", "10MB", folder, 0, producer,
+				WithCompletionPayload(func(Item) string { return "g1" })).(*fileCache)
+			Eventually(func() bool { return fc1.ready.Load() }, 10*time.Second).Should(BeTrue())
+			s, err := fc1.Get(context.Background(), mkArg("g1"))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(s.Close()).To(Succeed())
+			dataPath := fcSpreadFS(fc1).KeyMapper(mkArg("g1").Key())
+			Eventually(func() error { _, e := os.Stat(dataPath + ".complete"); return e }, "3s").Should(Succeed())
+
+			fc2 := NewFileCache("genret2", "10MB", folder, 0, producer,
+				WithCompletionPayload(func(Item) string { return "g1" }),
+				WithAdoptionPolicy(func(_ context.Context) (map[string]struct{}, error) {
+					return nil, errors.New("store temporarily unreachable")
+				}),
+			).(*fileCache)
+			Eventually(func() bool { return fc2.ready.Load() }, 10*time.Second).Should(BeTrue())
+
+			// Not adopted: a Get re-fetches (MISS)...
+			s2, err := fc2.Get(context.Background(), mkArg("g1"))
+			Expect(err).ToNot(HaveOccurred())
+			Expect(s2.Cached).To(BeFalse())
+			Expect(s2.Close()).To(Succeed())
+			// ...but the original bytes were never deleted.
+			_, err = os.Stat(dataPath)
+			Expect(err).To(Succeed())
+		})
+	})
 })
 
 type testArg struct{ s string }
 
 func (t *testArg) Key() string { return t.s }
+
+type genArg struct {
+	key        string
+	generation string
+}
+
+func (a *genArg) Key() string { return a.key }
 
 type errFakeReader struct{ err error }
 

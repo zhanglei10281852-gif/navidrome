@@ -54,10 +54,15 @@ type streamJob struct {
 	bitDepth   int
 	channels   int
 	offset     int
+	// generation pins the committed transcoding configuration. It is part of
+	// the cache key, so entries from a superseded configuration are never
+	// served as hits, and late output of an in-flight transcode lands in its
+	// own (old) namespace, never in the new one.
+	generation string
 }
 
 func (j *streamJob) Key() string {
-	return fmt.Sprintf("%s.%s.%d.%d.%d.%d.%s.%d", j.mf.ID, j.mf.UpdatedAt.Format(time.RFC3339Nano), j.bitRate, j.sampleRate, j.bitDepth, j.channels, j.format, j.offset)
+	return fmt.Sprintf("%s.%s.%d.%d.%d.%d.%s.%d.%s", j.mf.ID, j.mf.UpdatedAt.Format(time.RFC3339Nano), j.bitRate, j.sampleRate, j.bitDepth, j.channels, j.format, j.offset, j.generation)
 }
 
 // NewStream creates a Stream for the given MediaFile and Request. It handles both raw streaming (no transcoding)
@@ -98,6 +103,27 @@ func (ms *mediaStreamer) NewStream(ctx context.Context, mf *model.MediaFile, req
 		return s, nil
 	}
 
+	// Pin the committed configuration snapshot for this playback. Callers that
+	// went through the decision (all production paths) already carry the
+	// generation; resolve it here for direct callers so the command lookup and
+	// the cache namespace always share one snapshot.
+	generation := req.Generation
+	if generation == "" {
+		g, ok := EffectiveGeneration(ctx, ms.ds, format)
+		if !ok {
+			log.Error(ctx, "No transcoding command available", "id", mf.ID, "format", format)
+			return nil, os.ErrInvalid
+		}
+		generation = g
+	} else if snapshot, ok := EffectiveTranscoding(ctx, ms.ds, format); !ok || TranscodingGeneration(snapshot) != generation {
+		// The decision's snapshot is no longer the committed one. Refuse the
+		// launch: running the new command would violate the snapshot and a
+		// failed lookup can never serve this playback.
+		log.Warn(ctx, "Transcoding configuration changed since the playback decision; refusing stale snapshot",
+			"id", mf.ID, "format", format, "generation", generation)
+		return nil, ErrTranscodeConfigChanged
+	}
+
 	job := &streamJob{
 		ms:         ms,
 		mf:         mf,
@@ -108,6 +134,7 @@ func (ms *mediaStreamer) NewStream(ctx context.Context, mf *model.MediaFile, req
 		bitDepth:   req.BitDepth,
 		channels:   req.Channels,
 		offset:     req.Offset,
+		generation: generation,
 	}
 	r, err := ms.cache.Get(ctx, job)
 	if err != nil {
@@ -213,23 +240,45 @@ var (
 	instanceTranscodingCache TranscodingCache
 )
 
-func GetTranscodingCache() TranscodingCache {
+// GetTranscodingCache returns the process-wide transcoding cache. The data
+// store is used on startup to adopt only complete entries whose configuration
+// generation is still committed; see CurrentTranscodingGenerations.
+func GetTranscodingCache(ds model.DataStore) TranscodingCache {
 	onceTranscodingCache.Do(func() {
-		instanceTranscodingCache = NewTranscodingCache()
+		instanceTranscodingCache = NewTranscodingCache(
+			cache.WithCompletionPayload(func(item cache.Item) string {
+				return item.(*streamJob).generation
+			}),
+			cache.WithAdoptionPolicy(func(ctx context.Context) (map[string]struct{}, error) {
+				return CurrentTranscodingGenerations(ctx, ds)
+			}),
+		)
 	})
 	return instanceTranscodingCache
 }
 
-func NewTranscodingCache() TranscodingCache {
+func NewTranscodingCache(opts ...cache.Option) TranscodingCache {
 	return cache.NewFileCache("Transcoding", conf.Server.TranscodingCacheSize,
 		consts.TranscodingCacheDir, consts.DefaultTranscodingCacheMaxItems,
 		func(ctx context.Context, arg cache.Item) (io.Reader, error) {
 			job := arg.(*streamJob)
-			command := LookupTranscodeCommand(ctx, job.ms.ds, job.format)
-			if command == "" {
+			// Authoritative launch-time boundary: run the exact committed
+			// snapshot the playback was pinned to. If the configuration moved
+			// on since the decision, refuse instead of writing the output of a
+			// different command into this generation's namespace.
+			snapshot, ok := EffectiveTranscoding(ctx, job.ms.ds, job.format)
+			if !ok {
 				log.Error(ctx, "No transcoding command available", "format", job.format)
 				return nil, os.ErrInvalid
 			}
+			commandGeneration := TranscodingGeneration(snapshot)
+			if job.generation != "" && commandGeneration != job.generation {
+				log.Warn(ctx, "Refusing to launch transcoder with a different generation than the decision",
+					"id", job.mf.ID, "format", job.format,
+					"decisionGeneration", job.generation, "currentGeneration", commandGeneration)
+				return nil, ErrTranscodeConfigChanged
+			}
+			command := snapshot.Command
 
 			release, err := job.ms.limiter.Acquire(ctx, limiterKey(ctx))
 			if err != nil {

@@ -1,0 +1,10 @@
+navidrome project-03 转码缓存代际
+Rubric ID：1｜状态：通过｜期望行为：未修改 profile 的相同请求仍能命中完整缓存；raw/direct play、未配置转码的播放器以及既有多协议响应不新增转码或全局清缓存。｜实际观察：代际只影响转码请求和转码缓存键；未修改 profile 生成相同哈希，直接播放与无转码路径不新增转码。｜直接证据：core/stream generation 与 decider 测试、core/stream 和各协议带 fts5 无缓存测试通过。
+Rubric ID：2｜状态：通过｜期望行为：修改 command、默认码率或目标格式后，新请求使用同一个已提交配置快照并且不会命中旧配置生成的音频，即使媒体文件和输出参数表面相同。｜实际观察：决策解析一份已提交 profile 快照并把 command、format、bitrate 哈希代际贯穿 Request、Token、命令校验和缓存键。｜直接证据：core/stream/decider.go、token.go、media_streamer.go、types.go；配置变化缓存隔离测试通过。
+Rubric ID：3｜状态：通过｜期望行为：配置切换时已经运行的旧转码不会把迟到结果发布到新代缓存；并发的新旧请求各自获得与其配置快照一致的完整结果。｜实际观察：旧转码写入含旧代际的键，新请求只命中新代键，producer 启动前再次校验代际不一致即返回 ErrTranscodeConfigChanged。｜直接证据：core/stream/media_streamer.go 与对应迟到结果测试；-race 核心测试通过。
+Rubric ID：4｜状态：通过｜期望行为：转码配置的数据库更新失败时，活动配置、播放器决策和旧代缓存继续可用，不产生只在部分组件生效的新代。｜实际观察：代际由已提交数据库行按请求读取，数据库更新失败不会产生可解析的新代际或新缓存身份。｜直接证据：core/stream generation 解析路径与 persistence 更新语义；无独立活动配置缓存被提前修改。
+Rubric ID：5｜状态：未通过｜期望行为：删除仍被一个或多个播放器引用的 profile 时，管理操作确定地拒绝或完成明确回退并同步引用，后续播放不会因悬空 TranscodingId 随机返回错误。｜实际观察：Delete 先逐个 CountPlayers，随后逐个 deleteByID；检查结束后并发播放器写入 TranscodingId 可以发生在删除之前。｜直接证据：persistence/transcoding_repository.go:118-141 没有 Transactional 或锁包围检查和删除。｜原因：引用检查与 profile 删除不在同一数据库事务｜影响：可控交错中管理删除成功后播放器持久记录仍指向已删除 profile，后续播放进入悬空引用修复路径。｜证据位置：persistence/transcoding_repository.go:118-141
+Rubric ID：6｜状态：通过｜期望行为：服务重启只恢复与最后已提交配置代际匹配的完整缓存；旧代、未完成或失败结果不能在重启后重新成为命中。｜实际观察：完整 marker 携带代际，启动 adoption policy 只收养当前已提交代际，旧代和未完成文件不进入命中。｜直接证据：utils/cache/file_caches.go、spread_fs.go 及重启 adopt/prune/retain 测试通过。
+Rubric ID：7｜状态：通过｜期望行为：Subsonic、Jellyfin、分享流和格式化下载对同一已提交代际使用兼容的决策与缓存身份，不会只在某一个入口修复陈旧缓存。｜实际观察：Subsonic、Jellyfin、分享流和格式化下载都通过 ResolveRequest 或带代际 Token 构造相同缓存身份。｜直接证据：core/stream/legacy_client.go、server/public/handle_streams_test.go 与协议套件带 fts5 测试通过。
+
+关键验证：Go 测试均使用 -count=1；相关并发包使用 -race；SQLite FTS5 相关套件使用 -tags=fts5。

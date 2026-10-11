@@ -114,6 +114,20 @@ var _ = Describe("Players", func() {
 			Expect(trc.ID).To(Equal("1"))
 		})
 
+		It("clears a dangling transcoding reference deterministically", func() {
+			plr := &model.Player{ID: "123", Name: "A Player", Client: "client", UserId: "userid", TranscodingId: "ghost"}
+			repo.add(plr)
+			localDS := &tests.MockDataStore{MockedPlayer: repo, MockedTranscoding: missingTranscodingRepo{}}
+			ps := NewPlayers(localDS)
+
+			p, trc, err := ps.Register(ctx, "123", "client", "chrome", "1.2.3.4")
+			Expect(err).ToNot(HaveOccurred())
+			Expect(trc).To(BeNil())
+			Expect(p.TranscodingId).To(BeEmpty())
+			Expect(repo.lastSaved).ToNot(BeNil())
+			Expect(repo.lastSaved.TranscodingId).To(BeEmpty(), "the player reference must be synced to the fallback")
+		})
+
 		It("does not rename a player that has an API key", func() {
 			plr := &model.Player{ID: "123", Name: "My Phone", Client: "client", UserId: "userid", HasAPIKey: true}
 			repo.add(plr)
@@ -201,4 +215,13 @@ func (m *mockPlayerRepository) FindMatch(_ context.Context, userId, client, user
 func (m *mockPlayerRepository) Put(_ context.Context, p *model.Player) error {
 	m.lastSaved = p
 	return nil
+}
+
+// missingTranscodingRepo simulates a transcoding row that has been deleted.
+type missingTranscodingRepo struct {
+	model.TranscodingRepository
+}
+
+func (missingTranscodingRepo) Get(context.Context, string) (*model.Transcoding, error) {
+	return nil, model.ErrNotFound
 }

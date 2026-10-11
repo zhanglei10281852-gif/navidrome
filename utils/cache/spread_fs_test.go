@@ -88,6 +88,19 @@ var _ = Describe("Spread FS", func() {
 			Expect(statErr).To(BeNil())
 		})
 
+		It("records the generation payload in the marker", func() {
+			data := fs.KeyMapper("song-gen")
+			f, err := fs.Create(data)
+			Expect(err).To(BeNil())
+			_, _ = f.Write([]byte("ok"))
+			_ = f.Close()
+
+			Expect(fs.MarkCompleteWith(data, "gabc123")).To(Succeed())
+			payload, err := os.ReadFile(data + ".complete")
+			Expect(err).To(BeNil())
+			Expect(string(payload)).To(Equal("gabc123"))
+		})
+
 		It("removes the sibling marker when the data file is removed", func() {
 			data := fs.KeyMapper("song2")
 			f, err := fs.Create(data)
@@ -101,6 +114,77 @@ var _ = Describe("Spread FS", func() {
 			Expect(os.IsNotExist(dataErr)).To(BeTrue())
 			_, markErr := os.Stat(data + ".complete")
 			Expect(os.IsNotExist(markErr)).To(BeTrue())
+		})
+	})
+
+	Describe("Reload with a generation policy", func() {
+		// After the migration sentinel exists, every marker is evaluated.
+		makeCompleted := func(key, generation string) string {
+			data := fs.KeyMapper(key)
+			f, err := fs.Create(data)
+			Expect(err).To(BeNil())
+			_, _ = f.Write([]byte(key))
+			Expect(f.Close()).To(Succeed())
+			if generation == "" {
+				Expect(fs.MarkComplete(data)).To(Succeed())
+			} else {
+				Expect(fs.MarkCompleteWith(data, generation)).To(Succeed())
+			}
+			return data
+		}
+
+		BeforeEach(func() {
+			Expect(os.WriteFile(filepath.Join(rootDir, ".nd-migrated"), nil, 0600)).To(Succeed())
+		})
+
+		It("adopts only entries whose generation is committed and prunes the rest", func() {
+			current := makeCompleted("current", "g-current")
+			stale := makeCompleted("stale", "g-stale")
+			unknown := makeCompleted("unknown", "")
+
+			fs.SetAdoptionPolicy(func(payload string) AdoptionDecision {
+				if payload == "g-current" {
+					return AdoptCurrent
+				}
+				return PruneEntry
+			})
+
+			var adopted []string
+			Expect(fs.Reload(func(key, name string) { adopted = append(adopted, name) })).To(Succeed())
+			Expect(adopted).To(ConsistOf(current))
+
+			_, err := os.Stat(stale)
+			Expect(os.IsNotExist(err)).To(BeTrue())
+			_, err = os.Stat(stale + ".complete")
+			Expect(os.IsNotExist(err)).To(BeTrue())
+			_, err = os.Stat(unknown)
+			Expect(os.IsNotExist(err)).To(BeTrue())
+		})
+
+		It("retains entries on disk without adopting them when eligibility is undecided", func() {
+			retained := makeCompleted("retained", "g-retained")
+			current := makeCompleted("current", "g-current")
+
+			fs.SetAdoptionPolicy(func(payload string) AdoptionDecision {
+				if payload == "g-retained" {
+					return RetainEntry
+				}
+				return AdoptCurrent
+			})
+
+			var adopted []string
+			Expect(fs.Reload(func(key, name string) { adopted = append(adopted, name) })).To(Succeed())
+			Expect(adopted).To(ConsistOf(current))
+			_, err := os.Stat(retained)
+			Expect(err).To(Succeed(), "retained entries stay on disk for the next startup")
+		})
+
+		It("adopts every marked entry when no policy is installed", func() {
+			a := makeCompleted("a", "g1")
+			b := makeCompleted("b", "g2")
+			var adopted []string
+			Expect(fs.Reload(func(key, name string) { adopted = append(adopted, name) })).To(Succeed())
+			Expect(adopted).To(ConsistOf(a, b))
 		})
 	})
 

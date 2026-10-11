@@ -145,6 +145,87 @@ var _ = Describe("MediaStreamer", func() {
 			Expect(err).To(BeNil())
 			Expect(s.Seekable()).To(BeTrue())
 		})
+
+		Describe("configuration generations", func() {
+			// Builds an isolated stack (own cache, own ffmpeg) for a custom mp3
+			// command so generations are fully under test control.
+			newStack := func(command string, ff *tests.MockFFmpeg) (stream.MediaStreamer, stream.TranscodingCache, *tests.MockTranscodingRepo, model.DataStore) {
+				trcRepo := &tests.MockTranscodingRepo{Data: map[string]*model.Transcoding{
+					"mp3": {ID: "mp3-x", Name: "custom mp3", TargetFormat: "mp3", DefaultBitRate: 192, Command: command},
+				}}
+				localDS := &tests.MockDataStore{MockedTranscoding: trcRepo}
+				localDS.MediaFile().(*tests.MockMediaFileRepo).SetData(model.MediaFiles{
+					{ID: "123", Path: "tests/fixtures/test.mp3", Suffix: "mp3", BitRate: 128, Duration: 257.0},
+				})
+				c := stream.NewTranscodingCache()
+				Eventually(func() bool { return c.Available(context.TODO()) }, 10*time.Second).Should(BeTrue())
+				return stream.NewMediaStreamer(localDS, ff, c), c, trcRepo, localDS
+			}
+
+			It("never serves the old generation's cache after the command changes", func() {
+				s1, sharedCache, repo, ds1 := newStack("ffmpeg -command v1", tests.NewMockFFmpeg("gen1-data"))
+				gen1, ok := stream.EffectiveGeneration(ctx, ds1, "mp3")
+				Expect(ok).To(BeTrue())
+
+				// First generation: transcode and fully populate the cache.
+				r1, err := s1.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 32, Generation: gen1})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(r1.Seekable()).To(BeFalse()) // cache MISS
+				data1, err := io.ReadAll(r1)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(string(data1)).To(Equal("gen1-data"))
+				_ = r1.Close()
+
+				// Admin commits a new command.
+				repo.Data["mp3"].Command = "ffmpeg -command v2"
+				gen2, ok := stream.EffectiveGeneration(ctx, ds1, "mp3")
+				Expect(ok).To(BeTrue())
+				Expect(gen2).NotTo(Equal(gen1))
+
+				// A second streamer, same on-disk cache, new ffmpeg output.
+				s2 := stream.NewMediaStreamer(ds1, tests.NewMockFFmpeg("gen2-data"), sharedCache)
+
+				// The new generation must be a MISS, never the old complete entry.
+				r2, err := s2.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 32, Generation: gen2})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(r2.Seekable()).To(BeFalse(), "changed generation must not hit the pre-change cache")
+				data2, err := io.ReadAll(r2)
+				Expect(err).ToNot(HaveOccurred())
+				Expect(string(data2)).To(Equal("gen2-data"), "new generation output must never come from the old cache")
+				_ = r2.Close()
+
+				// Once complete, the new generation hits its own namespace.
+				Eventually(func() bool {
+					r3, err := s2.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 32, Generation: gen2})
+					if err != nil {
+						return false
+					}
+					defer r3.Close()
+					return r3.Seekable()
+				}, "3s").Should(BeTrue())
+
+				// A request still pinned to the old committed snapshot is
+				// refused instead of launching v2 under the v1 generation.
+				_, err = s2.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 32, Generation: gen1})
+				Expect(err).To(MatchError(stream.ErrTranscodeConfigChanged))
+			})
+
+			It("keeps cache hits stable for an unchanged configuration", func() {
+				s, _, _, localDS := newStack("ffmpeg -stable", tests.NewMockFFmpeg("stable-data"))
+				gen, ok := stream.EffectiveGeneration(ctx, localDS, "mp3")
+				Expect(ok).To(BeTrue())
+
+				r1, err := s.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 64, Generation: gen})
+				Expect(err).ToNot(HaveOccurred())
+				_, _ = io.ReadAll(r1)
+				_ = r1.Close()
+
+				r2, err := s.NewStream(ctx, mf, stream.Request{Format: "mp3", BitRate: 64, Generation: gen})
+				Expect(err).ToNot(HaveOccurred())
+				Expect(r2.Seekable()).To(BeTrue(), "unchanged generation must keep hitting its cache")
+				_ = r2.Close()
+			})
+		})
 	})
 
 	Context("Serve", func() {

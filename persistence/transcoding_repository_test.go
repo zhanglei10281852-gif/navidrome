@@ -2,6 +2,7 @@ package persistence
 
 import (
 	"context"
+	"errors"
 
 	"github.com/deluan/rest"
 	"github.com/navidrome/navidrome/log"
@@ -66,6 +67,71 @@ var _ = Describe("TranscodingRepository", func() {
 		It("returns not found when deleting a missing transcoding", func() {
 			err := repo.(*transcodingRepository).Delete(adminCtx, "does-not-exist")
 			Expect(err).To(MatchError(model.ErrNotFound))
+		})
+
+		It("refuses to delete a transcoding still referenced by a player", func() {
+			trcID := "in-use"
+			Expect(repo.Put(adminCtx, &model.Transcoding{ID: trcID, Name: "in-use", TargetFormat: "test_format", DefaultBitRate: 256, Command: "ffmpeg"})).To(Succeed())
+
+			players := NewPlayerRepository(GetDBXBuilder())
+			plr := &model.Player{ID: "player-using-trc", Name: "P", Client: "client-x", UserId: adminUser.ID, TranscodingId: trcID}
+			Expect(players.Put(adminCtx, plr)).To(Succeed())
+			DeferCleanup(func() { _ = players.Delete(adminCtx, plr.ID) })
+
+			err := repo.Delete(adminCtx, trcID)
+			var verr *rest.ValidationError
+			Expect(errors.As(err, &verr)).To(BeTrue())
+
+			// The profile is still committed and the reference stays intact.
+			res, getErr := repo.Get(adminCtx, trcID)
+			Expect(getErr).ToNot(HaveOccurred())
+			Expect(res.ID).To(Equal(trcID))
+			stored, pErr := players.Get(adminCtx, plr.ID)
+			Expect(pErr).ToNot(HaveOccurred())
+			Expect(stored.TranscodingId).To(Equal(trcID))
+
+			// Once no player references it, the same delete succeeds.
+			stored.TranscodingId = ""
+			Expect(players.Put(adminCtx, stored)).To(Succeed())
+			Expect(repo.Delete(adminCtx, trcID)).To(Succeed())
+		})
+
+		It("does not delete anything when one id of a batch is still referenced", func() {
+			Expect(repo.Put(adminCtx, &model.Transcoding{ID: "batch-a", Name: "a", TargetFormat: "test_format", DefaultBitRate: 64, Command: "ffmpeg"})).To(Succeed())
+			Expect(repo.Put(adminCtx, &model.Transcoding{ID: "batch-b", Name: "b", TargetFormat: "test_format_b", DefaultBitRate: 64, Command: "ffmpeg"})).To(Succeed())
+			players := NewPlayerRepository(GetDBXBuilder())
+			plr := &model.Player{ID: "player-batch", Name: "P", Client: "client-b", UserId: adminUser.ID, TranscodingId: "batch-b"}
+			Expect(players.Put(adminCtx, plr)).To(Succeed())
+			DeferCleanup(func() {
+				_ = players.Delete(adminCtx, plr.ID)
+				_ = repo.Delete(adminCtx, "batch-a", "batch-b")
+			})
+
+			err := repo.Delete(adminCtx, "batch-a", "batch-b")
+			var verr *rest.ValidationError
+			Expect(errors.As(err, &verr)).To(BeTrue())
+
+			// All-or-nothing: the unreferenced id in the same batch survives too.
+			_, err = repo.Get(adminCtx, "batch-a")
+			Expect(err).ToNot(HaveOccurred())
+			_, err = repo.Get(adminCtx, "batch-b")
+			Expect(err).ToNot(HaveOccurred())
+		})
+
+		It("returns every row with its command via All regardless of privileges", func() {
+			Expect(repo.Put(adminCtx, &model.Transcoding{ID: "allread", Name: "temp", TargetFormat: "test_format", DefaultBitRate: 64, Command: "ffmpeg -secret"})).To(Succeed())
+			for _, c := range []context.Context{ctx, adminCtx} {
+				list, err := repo.All(c)
+				Expect(err).ToNot(HaveOccurred())
+				var found *model.Transcoding
+				for i := range list {
+					if list[i].ID == "allread" {
+						found = &list[i]
+					}
+				}
+				Expect(found).ToNot(BeNil())
+				Expect(found.Command).To(Equal("ffmpeg -secret"))
+			}
 		})
 
 		It("reads the Command field via the REST Read method", func() {
