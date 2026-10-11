@@ -26,6 +26,7 @@ type plugin struct {
 	libraries      libraryAccess
 	lyricsSem      chan struct{}   // Caps concurrent lyrics calls (see LyricsPlugin.GetLyrics)
 	fsConfig       wazero.FSConfig // Sandboxed library mounts, nil if no filesystem permission
+	generation     uint64          // Commit generation represented by this instance; 0 = startup/CLI load
 }
 
 // instanceConfig is used by every call site, so all instances get the sandboxed mounts.

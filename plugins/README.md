@@ -349,13 +349,13 @@ The `payload` is raw bytes (the same bytes passed to `TaskEnqueue`). The `attemp
 
 ### Lifecycle
 
-Optional initialization callback. Called once after the plugin fully loads.
+Optional initialization callback. It runs while the plugin is still an unpublished candidate, so returning an error rejects the load (or the settings save): the candidate is discarded and — when reconfiguring a running plugin — the previously active instance keeps serving with the last saved settings.
 
-| Function     | Input | Output     | Description                    |
-|--------------|-------|------------|--------------------------------|
-| `nd_on_init` | `{}`  | `{error?}` | Called once after plugin loads |
+| Function     | Input | Output     | Description                                |
+|--------------|-------|------------|--------------------------------------------|
+| `nd_on_init` | `{}`  | `{error?}` | Called once after a candidate fully builds |
 
-Useful for initializing connections, scheduling recurring tasks, etc. Errors are logged but don't prevent the plugin from loading.
+Useful for initializing connections, scheduling recurring tasks, etc. An init error is reported on the management request (and stored as the plugin's last error) rather than leaving a half-initialized plugin active.
 
 ### SchedulerCallback
 

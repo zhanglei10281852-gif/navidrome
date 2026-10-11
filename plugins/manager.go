@@ -3,10 +3,10 @@ package plugins
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"path/filepath"
-	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -55,6 +55,18 @@ type Manager struct {
 	stopped atomic.Bool    // Set to true when Stop() is called
 	loadWg  sync.WaitGroup // Tracks in-flight plugin load operations
 
+	// genSeq assigns commit generations to published instances. Guarded by mu.
+	// Every successful publish increments it; reclaiming an old generation only
+	// ever closes the exact pointer that publish replaced.
+	genSeq uint64
+
+	// opMu guards opLocks. opLocks serializes enable/disable/settings commits
+	// per plugin ID, so a straggling save rebuilds on top of the newest
+	// committed row and can never overwrite a newer success or close a newer
+	// generation. Different plugins still proceed in parallel.
+	opMu    sync.Mutex
+	opLocks map[string]*sync.Mutex
+
 	// File watcher fields (used when AutoReload is enabled)
 	watcherEvents  chan notify.EventInfo
 	watcherDone    chan struct{}
@@ -76,12 +88,37 @@ type Manager struct {
 func GetManager(ds model.DataStore, broker events.Broker, m PluginMetricsRecorder) *Manager {
 	return singleton.GetInstance(func() *Manager {
 		return &Manager{
+			plugins: make(map[string]*plugin),
+			opLocks: make(map[string]*sync.Mutex),
 			ds:      ds,
 			broker:  broker,
 			metrics: m,
-			plugins: make(map[string]*plugin),
 		}
 	})
+}
+
+// pluginOpLock returns the mutex serializing mutating operations (enable,
+// disable, settings commits) for a single plugin ID. Locks are created lazily
+// so Managers constructed directly (tests, CLI) need no initialization.
+func (m *Manager) pluginOpLock(id string) *sync.Mutex {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	if m.opLocks == nil {
+		m.opLocks = make(map[string]*sync.Mutex)
+	}
+	opLock, ok := m.opLocks[id]
+	if !ok {
+		opLock = &sync.Mutex{}
+		m.opLocks[id] = opLock
+	}
+	return opLock
+}
+
+// activePlugin returns the currently published instance for id, or nil.
+func (m *Manager) activePlugin(id string) *plugin {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.plugins[id]
 }
 
 // sendPluginRefreshEvent broadcasts a refresh event for the plugin resource.
@@ -316,11 +353,18 @@ func (m *Manager) GetPluginInfo() map[string]PluginInfo {
 }
 
 // EnablePlugin enables a plugin by loading it and updating the DB.
-// Returns an error if the plugin is not found in DB or fails to load.
+// The candidate is fully built (Wasm, host services, init) before any state is
+// committed; on failure nothing is published and the stored row keeps the
+// plugin disabled with a diagnosable LastError.
 func (m *Manager) EnablePlugin(ctx context.Context, id string) error {
 	if m.ds == nil {
 		return fmt.Errorf("datastore not configured")
 	}
+
+	// Serialize against concurrent saves/disable of the same plugin.
+	opLock := m.pluginOpLock(id)
+	opLock.Lock()
+	defer opLock.Unlock()
 
 	adminCtx := adminContext(ctx)
 	repo := m.ds.Plugin()
@@ -339,26 +383,38 @@ func (m *Manager) EnablePlugin(ctx context.Context, id string) error {
 		return err
 	}
 
-	// Try to load the plugin
-	if err := m.loadPluginWithConfig(plugin); err != nil {
-		// Store error and return
+	expected := m.activePlugin(id)
+
+	candidate, err := m.buildPluginCandidate(plugin)
+	if err != nil {
 		plugin.LastError = err.Error()
 		plugin.UpdatedAt = time.Now()
 		_ = repo.Put(adminCtx, plugin)
 		return fmt.Errorf("loading plugin: %w", err)
 	}
 
-	// Update DB
-	plugin.Enabled = true
-	plugin.LastError = ""
-	plugin.UpdatedAt = time.Now()
-	if err := repo.Put(adminCtx, plugin); err != nil {
-		// Unload since we couldn't update DB
-		_ = m.unloadPlugin(id)
-		return fmt.Errorf("updating plugin in DB: %w", err)
+	initCtx := log.NewContext(m.ctx, "plugin", id)
+	// Match loadPluginWithConfig: a transient inspection that did not ask for
+	// init must not run the plugin's arbitrary code.
+	if m.transient == nil || m.transient.runInit {
+		if err := callPluginInit(initCtx, candidate.p); err != nil {
+			candidate.close(initCtx)
+			plugin.LastError = err.Error()
+			plugin.UpdatedAt = time.Now()
+			_ = repo.Put(adminCtx, plugin)
+			return fmt.Errorf("loading plugin: %w", err)
+		}
 	}
 
-	log.Info(ctx, "Enabled plugin", "plugin", id)
+	// Commit DB row and active instance together; on failure the candidate is
+	// cleaned up by commitCandidate and nothing is left running.
+	plugin.Enabled = true
+	plugin.UpdatedAt = time.Now()
+	if err := m.commitCandidate(adminCtx, repo, plugin, candidate, expected); err != nil {
+		return err
+	}
+
+	log.Info(ctx, "Enabled plugin", "plugin", id, "generation", candidate.p.generation)
 	m.sendPluginRefreshEvent(ctx, id)
 	return nil
 }
@@ -369,6 +425,10 @@ func (m *Manager) DisablePlugin(ctx context.Context, id string) error {
 	if m.ds == nil {
 		return fmt.Errorf("datastore not configured")
 	}
+
+	opLock := m.pluginOpLock(id)
+	opLock.Lock()
+	defer opLock.Unlock()
 
 	adminCtx := adminContext(ctx)
 	repo := m.ds.Plugin()
@@ -467,13 +527,28 @@ func (m *Manager) RescanPlugins(ctx context.Context) error {
 }
 
 // updatePluginSettings is a common implementation for updating plugin settings.
-// The updateFn is called to apply the specific field updates to the plugin.
-// If the plugin is enabled, it will be reloaded. If users permission is required
-// but no longer satisfied, the plugin will be disabled.
+//
+// Settings updates use a candidate commit: the new settings are applied to a
+// private copy of the row, a full candidate is built with them (Wasm, all host
+// services, init) and only after it proves runnable are the persisted row and
+// the active instance swapped together, after which the replaced generation is
+// reclaimed. A candidate failure (or a database failure) discards only the
+// candidate: the last successfully committed settings stay in the database and
+// keep serving via the old instance, and a diagnosable error is returned.
+//
+// A disabled plugin only stores the settings without starting. Removing a
+// permission the plugin requires keeps the normal disable semantics.
 func (m *Manager) updatePluginSettings(ctx context.Context, id string, updateFn func(*model.Plugin)) error {
 	if m.ds == nil {
 		return fmt.Errorf("datastore not configured")
 	}
+
+	// Serialize concurrent saves of the same plugin: the lock is held across
+	// build and commit, so a request that arrives later reads the newest
+	// committed row after acquiring it and can never overwrite a newer success.
+	opLock := m.pluginOpLock(id)
+	opLock.Lock()
+	defer opLock.Unlock()
 
 	adminCtx := adminContext(ctx)
 	repo := m.ds.Plugin()
@@ -482,64 +557,120 @@ func (m *Manager) updatePluginSettings(ctx context.Context, id string, updateFn 
 	if err != nil {
 		return fmt.Errorf("getting plugin from DB: %w", err)
 	}
+	// Work on a private copy: a repository may hand back a pointer it still
+	// owns, and a rejected save must not leave the in-memory row half-edited.
+	rowCopy := *plugin
+	plugin = &rowCopy
 
 	wasEnabled := plugin.Enabled
 
-	// Apply the specific updates
+	// Apply the specific updates to a private, not-yet-persisted copy
 	updateFn(plugin)
 	plugin.UpdatedAt = time.Now()
 
-	// Check if plugin requires permission and if it's still satisfied
-	shouldDisable := false
-	disableReason := ""
+	// Check if plugin requires a permission that is no longer satisfied: normal disable semantics.
 	if wasEnabled {
-		manifest, err := ReadManifest(plugin.Path)
-		if err == nil && manifest.Permissions != nil {
-			if manifest.Permissions.Users != nil && !hasValidUsersConfig(plugin.Users, plugin.AllUsers) {
-				shouldDisable = true
-				disableReason = "users permission removal"
+		if reason := permissionLossReason(plugin); reason != "" {
+			// Disable the plugin since permission is no longer satisfied
+			if err := m.unloadPlugin(id); err != nil {
+				log.Debug(ctx, "Plugin was not loaded", "plugin", id)
 			}
-			if manifest.Permissions.Library != nil && !hasValidLibrariesConfig(plugin.Libraries, plugin.AllLibraries) {
-				shouldDisable = true
-				disableReason = "library permission removal"
+			plugin.Enabled = false
+			if err := repo.Put(adminCtx, plugin); err != nil {
+				return fmt.Errorf("updating plugin in DB: %w", err)
 			}
+			log.Info(ctx, "Disabled plugin due to "+reason, "plugin", id)
+			m.sendPluginRefreshEvent(ctx, id)
+			return nil
 		}
 	}
 
-	if shouldDisable {
-		// Disable the plugin since permission is no longer satisfied
-		if err := m.unloadPlugin(id); err != nil {
-			log.Debug(ctx, "Plugin was not loaded", "plugin", id)
-		}
-		plugin.Enabled = false
+	// Disabled plugins only persist the new settings; they never start an instance.
+	if !wasEnabled {
 		if err := repo.Put(adminCtx, plugin); err != nil {
 			return fmt.Errorf("updating plugin in DB: %w", err)
 		}
-		log.Info(ctx, "Disabled plugin due to "+disableReason, "plugin", id)
+		log.Info(ctx, "Updated plugin settings while disabled", "plugin", id)
 		m.sendPluginRefreshEvent(ctx, id)
 		return nil
 	}
 
-	if err := repo.Put(adminCtx, plugin); err != nil {
-		return fmt.Errorf("updating plugin in DB: %w", err)
+	// Enabled plugin: build and validate the whole candidate with the new
+	// settings BEFORE touching the database or the active instance.
+	expected := m.activePlugin(id)
+
+	candidate, err := m.buildPluginCandidate(plugin)
+	if err != nil {
+		saveErr := fmt.Errorf("reloading plugin with new settings: %w", err)
+		m.recordCandidateError(adminCtx, id, saveErr)
+		return saveErr
 	}
 
-	// Reload if enabled
-	if wasEnabled {
-		if err := m.unloadPlugin(id); err != nil {
-			log.Debug(ctx, "Plugin was not loaded", "plugin", id)
-		}
-		if err := m.loadPluginWithConfig(plugin); err != nil {
-			plugin.LastError = err.Error()
-			plugin.Enabled = false
-			_ = repo.Put(adminCtx, plugin)
-			return fmt.Errorf("reloading plugin: %w", err)
+	initCtx := log.NewContext(m.ctx, "plugin", id)
+	// Init belongs to the validated candidate; a transient inspection that did
+	// not ask for init keeps skipping it (see loadPluginWithConfig).
+	if m.transient == nil || m.transient.runInit {
+		if err := callPluginInit(initCtx, candidate.p); err != nil {
+			candidate.close(initCtx)
+			saveErr := fmt.Errorf("reloading plugin with new settings: %w", err)
+			m.recordCandidateError(adminCtx, id, saveErr)
+			return saveErr
 		}
 	}
 
-	log.Info(ctx, "Updated plugin settings", "plugin", id)
+	// Commit the row and swap the active instance as one step. On any failure
+	// commitCandidate discards the candidate and leaves the old instance and
+	// row authoritative.
+	if err := m.commitCandidate(adminCtx, repo, plugin, candidate, expected); err != nil {
+		// A conflict means a newer operation already won; its result stands, so
+		// don't overwrite that row's LastError. Surface the error for retry.
+		if !errors.Is(err, errPluginGenerationConflict) {
+			m.recordCandidateError(adminCtx, id, err)
+		}
+		return err
+	}
+
+	log.Info(ctx, "Updated plugin settings", "plugin", id, "generation", candidate.p.generation)
 	m.sendPluginRefreshEvent(ctx, id)
 	return nil
+}
+
+// permissionLossReason reports why an enabled plugin must be disabled after a
+// settings change. It returns "" when every permission the manifest requires
+// remains configured (or when the manifest cannot be read, which other flows
+// surface as load errors).
+func permissionLossReason(p *model.Plugin) string {
+	manifest, err := ReadManifest(p.Path)
+	if err != nil || manifest.Permissions == nil {
+		return ""
+	}
+	if manifest.Permissions.Users != nil && !hasValidUsersConfig(p.Users, p.AllUsers) {
+		return "users permission removal"
+	}
+	if manifest.Permissions.Library != nil && !hasValidLibrariesConfig(p.Libraries, p.AllLibraries) {
+		return "library permission removal"
+	}
+	return ""
+}
+
+// recordCandidateError attaches a rejected save's diagnostic to the still
+// committed row, re-reading it so the failed settings themselves are never
+// persisted. The old configuration and enabled state are untouched and the old
+// instance keeps serving; only LastError (plus UpdatedAt) changes.
+func (m *Manager) recordCandidateError(ctx context.Context, id string, cause error) {
+	repo := m.ds.Plugin()
+	stored, err := repo.Get(ctx, id)
+	if err != nil {
+		log.Debug(ctx, "Could not reload plugin row to record settings error", "plugin", id, err)
+		return
+	}
+	stored.LastError = cause.Error()
+	stored.UpdatedAt = time.Now()
+	if err := repo.Put(ctx, stored); err != nil {
+		log.Error(ctx, "Failed to record plugin settings error", "plugin", id, err)
+		return
+	}
+	m.sendPluginRefreshEvent(ctx, id)
 }
 
 // unloadPlugin removes a plugin from the manager and closes its resources.
@@ -554,25 +685,8 @@ func (m *Manager) unloadPlugin(name string) error {
 	delete(m.plugins, name)
 	m.mu.Unlock()
 
-	// Run cleanup functions
-	err := plugin.Close()
-	if err != nil {
-		log.Error("Error during plugin cleanup", "plugin", name, err)
-	}
-
-	// Close the compiled plugin outside the lock with a grace period
-	// to allow in-flight requests to complete
-	if plugin.compiled != nil {
-		// Use a brief timeout for cleanup
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := plugin.compiled.Close(ctx); err != nil {
-			log.Error("Error closing plugin during unload", "plugin", name, err)
-		}
-	}
-
-	runtime.GC()
-	log.Info(m.ctx, "Unloaded plugin", "plugin", name)
+	destroyPlugin(name, plugin)
+	log.Info(m.ctx, "Unloaded plugin", "plugin", name, "generation", plugin.generation)
 	return nil
 }
 

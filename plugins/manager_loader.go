@@ -3,8 +3,10 @@ package plugins
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"runtime"
 	"slices"
 	"time"
 
@@ -288,18 +290,73 @@ func (m *Manager) loadEnabledPlugins(ctx context.Context) error {
 	return g.Wait()
 }
 
-// loadPluginWithConfig loads a plugin with configuration from DB.
-// The p.Path should point to an .ndp package file.
+// loadPluginWithConfig builds a plugin from its stored configuration, runs its
+// init hook, and publishes it as the active instance, replacing any instance
+// already published for the same ID. Startup/CLI callers use it directly.
+//
+// Settings saves do NOT use it: they go through buildPluginCandidate →
+// callPluginInit → commitCandidate, so a candidate that cannot compile, whose
+// host services cannot be created, or whose init fails is discarded without
+// disturbing the running instance or persisting the unusable settings.
 func (m *Manager) loadPluginWithConfig(p *model.Plugin) error {
+	candidate, err := m.buildPluginCandidate(p)
+	if err != nil {
+		return err
+	}
+
+	ctx := log.NewContext(m.ctx, "plugin", p.ID)
+	// Init is the plugin's first chance to run arbitrary code: open sockets,
+	// create task queues, schedule work. Only a caller that already intends to
+	// reach the network asks for it. A failure invalidates the whole candidate.
+	// Use the local: startup loads run concurrently, so reading the map back
+	// here would race the writes.
+	if m.transient == nil || m.transient.runInit {
+		if err := callPluginInit(ctx, candidate.p); err != nil {
+			candidate.close(ctx)
+			return err
+		}
+	}
+
+	m.publishPlugin(ctx, candidate)
+	return nil
+}
+
+// pluginCandidate is a fully built plugin instance — compiled Wasm plus every
+// host service its permissions grant — that has NOT been published. It owns
+// its resources until they are either committed (publishPlugin /
+// commitCandidate) or released by close. A rejected commit must call close.
+type pluginCandidate struct {
+	id string
+	p  *plugin
+}
+
+// close releases every resource owned by a candidate that was never published.
+// It must not be called after a successful commit; those resources belong to
+// the active instance or to the generation being reclaimed.
+func (c *pluginCandidate) close(ctx context.Context) {
+	if c == nil || c.p == nil {
+		return
+	}
+	destroyPlugin(c.id, c.p)
+	log.Debug(ctx, "Discarded plugin candidate", "plugin", c.id)
+}
+
+// buildPluginCandidate compiles the Wasm for p, creates all host services its
+// permissions grant, detects capabilities and validates the manifest against
+// them, without registering anything in the manager and without touching the
+// database. The returned candidate must be committed or closed. On any failure
+// all resources accumulated for it are released and the active instance is
+// never affected.
+func (m *Manager) buildPluginCandidate(p *model.Plugin) (_ *pluginCandidate, err error) {
 	// NewContext falls back to context.Background() when m.ctx is nil (unstarted manager)
 	ctx := log.NewContext(m.ctx, "plugin", p.ID)
 
 	if m.stopped.Load() {
-		return fmt.Errorf("manager is stopped")
+		return nil, fmt.Errorf("manager is stopped")
 	}
 
 	if !validPluginID(p.ID) {
-		return fmt.Errorf("invalid plugin ID %q", p.ID)
+		return nil, fmt.Errorf("invalid plugin ID %q", p.ID)
 	}
 
 	// Track this operation
@@ -307,20 +364,20 @@ func (m *Manager) loadPluginWithConfig(p *model.Plugin) error {
 	defer m.loadWg.Done()
 
 	if m.stopped.Load() {
-		return fmt.Errorf("manager is stopped")
+		return nil, fmt.Errorf("manager is stopped")
 	}
 
 	// Parse config from JSON
 	pluginConfig, err := parsePluginConfig(p.Config)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	// Parse users from JSON
 	var allowedUsers []string
 	if p.Users != "" {
 		if err := json.Unmarshal([]byte(p.Users), &allowedUsers); err != nil {
-			return fmt.Errorf("parsing plugin users: %w", err)
+			return nil, fmt.Errorf("parsing plugin users: %w", err)
 		}
 	}
 
@@ -328,14 +385,14 @@ func (m *Manager) loadPluginWithConfig(p *model.Plugin) error {
 	var allowedLibraries []int
 	if p.Libraries != "" {
 		if err := json.Unmarshal([]byte(p.Libraries), &allowedLibraries); err != nil {
-			return fmt.Errorf("parsing plugin libraries: %w", err)
+			return nil, fmt.Errorf("parsing plugin libraries: %w", err)
 		}
 	}
 
 	// Open the .ndp package to get manifest and wasm bytes
 	pkg, err := openPackage(p.Path)
 	if err != nil {
-		return fmt.Errorf("opening package: %w", err)
+		return nil, fmt.Errorf("opening package: %w", err)
 	}
 
 	pluginManifest := buildExtismManifest(pkg, pluginConfig)
@@ -349,7 +406,7 @@ func (m *Manager) loadPluginWithConfig(p *model.Plugin) error {
 			adminCtx := adminContext(ctx)
 			libraries, err := m.ds.Library().GetAll(adminCtx)
 			if err != nil {
-				return fmt.Errorf("failed to get libraries for filesystem access: %w", err)
+				return nil, fmt.Errorf("failed to get libraries for filesystem access: %w", err)
 			}
 			mounts = buildMounts(ctx, libraries, allowedLibraries, p.AllLibraries, p.AllowWriteAccess)
 		}
@@ -367,17 +424,26 @@ func (m *Manager) loadPluginWithConfig(p *model.Plugin) error {
 		fsConfig = buildFSConfig(mounts)
 	}
 
-	// Build host functions based on permissions from manifest
+	// Build host functions based on permissions from manifest. Resources are owned by the
+	// candidate on success; the deferred cleanup below releases them on any failure, along
+	// with the compiled module once it exists, so a rejected candidate leaks nothing.
 	var hostFunctions []extism.HostFunction
 	var closers []io.Closer
-	loaded := false
-	// On success the closers are owned by the registered plugin; on any
-	// failure past this point, close them so partially-created services
-	// don't leak goroutines or file handles.
+	var compiled *extism.CompiledPlugin
+	committed := false
 	defer func() {
-		if !loaded {
-			closeAll(closers)
+		if committed {
+			return
 		}
+		closeAll(closers)
+		if compiled != nil {
+			closeCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if closeErr := compiled.Close(closeCtx); closeErr != nil {
+				log.Error(ctx, "Error closing compiled candidate", "plugin", p.ID, closeErr)
+			}
+		}
+		runtime.GC()
 	}()
 
 	svcCtx := &serviceContext{
@@ -394,7 +460,7 @@ func (m *Manager) loadPluginWithConfig(p *model.Plugin) error {
 		if entry.hasPermission(pkg.Manifest.Permissions) {
 			funcs, closer, err := entry.create(svcCtx)
 			if err != nil {
-				return fmt.Errorf("creating %s service: %w", entry.name, err)
+				return nil, fmt.Errorf("creating %s service: %w", entry.name, err)
 			}
 			hostFunctions = append(hostFunctions, funcs...)
 			if closer != nil {
@@ -413,16 +479,15 @@ func (m *Manager) loadPluginWithConfig(p *model.Plugin) error {
 		RuntimeConfig:             runtimeConfig,
 		EnableHttpResponseHeaders: true,
 	}
-	compiled, err := extism.NewCompiledPlugin(ctx, pluginManifest, extismConfig, hostFunctions)
+	compiled, err = extism.NewCompiledPlugin(ctx, pluginManifest, extismConfig, hostFunctions)
 	if err != nil {
-		return fmt.Errorf("compiling plugin: %w", err)
+		return nil, fmt.Errorf("compiling plugin: %w", err)
 	}
 
 	// Create instance to detect capabilities
 	instance, err := compiled.Instance(ctx, instanceConfig(fsConfig))
 	if err != nil {
-		compiled.Close(ctx)
-		return fmt.Errorf("creating instance: %w", err)
+		return nil, fmt.Errorf("creating instance: %w", err)
 	}
 	instance.SetLogger(extismLogger(p.ID))
 	capabilities := detectCapabilities(instance)
@@ -430,8 +495,7 @@ func (m *Manager) loadPluginWithConfig(p *model.Plugin) error {
 
 	// Validate manifest against detected capabilities
 	if err := ValidateWithCapabilities(pkg.Manifest, capabilities); err != nil {
-		compiled.Close(ctx)
-		return fmt.Errorf("manifest validation: %w", err)
+		return nil, fmt.Errorf("manifest validation: %w", err)
 	}
 
 	loadedPlugin := &plugin{
@@ -448,19 +512,91 @@ func (m *Manager) loadPluginWithConfig(p *model.Plugin) error {
 		fsConfig:       fsConfig,
 		lyricsSem:      make(chan struct{}, maxConcurrentLyricsCalls),
 	}
-	m.mu.Lock()
-	m.plugins[p.ID] = loadedPlugin
-	m.mu.Unlock()
-	loaded = true
+	committed = true
+	return &pluginCandidate{id: p.ID, p: loadedPlugin}, nil
+}
 
-	// Init is the plugin's first chance to run arbitrary code: open sockets, create task queues,
-	// schedule work. Only a caller that already intends to reach the network asks for it.
-	// Use the local: loads run concurrently, so reading the map back here would race the writes.
-	if m.transient == nil || m.transient.runInit {
-		callPluginInit(ctx, loadedPlugin)
+// errPluginGenerationConflict means the active instance for a plugin changed
+// while a candidate was being built (file rescan, unload, disable, shutdown).
+// The save must be retried against the current state instead of being forced
+// over the newer committed generation.
+var errPluginGenerationConflict = errors.New("plugin state changed while saving settings")
+
+// publishPlugin installs candidate as the single active instance for its ID
+// under the manager lock, assigns the next generation, and fully reclaims the
+// generation it replaced. Startup loads (row already persisted) call it
+// directly; settings saves must go through commitCandidate so the database row
+// and the active instance switch together.
+func (m *Manager) publishPlugin(ctx context.Context, candidate *pluginCandidate) *plugin {
+	m.mu.Lock()
+	m.genSeq++
+	candidate.p.generation = m.genSeq
+	old := m.plugins[candidate.id]
+	m.plugins[candidate.id] = candidate.p
+	m.mu.Unlock()
+
+	if old != nil {
+		destroyPlugin(candidate.id, old)
+		log.Debug(ctx, "Reclaimed superseded plugin generation",
+			"plugin", candidate.id, "oldGeneration", old.generation, "newGeneration", candidate.p.generation)
+	}
+	return old
+}
+
+// commitCandidate makes a validated candidate the active instance together
+// with its persisted row. Under the manager lock it first verifies that the
+// active instance is still the exact one (expected) the candidate was built
+// against, then upserts row and swaps the map entry; only then is the lock
+// released and the replaced generation reclaimed. A generation mismatch or a
+// database failure destroys the candidate and leaves the previous instance and
+// row serving, returning a diagnosable error.
+func (m *Manager) commitCandidate(ctx context.Context, repo model.PluginRepository, row *model.Plugin, candidate *pluginCandidate, expected *plugin) error {
+	m.mu.Lock()
+	if m.plugins[row.ID] != expected {
+		m.mu.Unlock()
+		candidate.close(ctx)
+		return fmt.Errorf("%w for %q: a newer instance is active, retry the save", errPluginGenerationConflict, row.ID)
 	}
 
+	row.LastError = ""
+	if err := repo.Put(ctx, row); err != nil {
+		m.mu.Unlock()
+		candidate.close(ctx)
+		return fmt.Errorf("updating plugin in DB: %w", err)
+	}
+
+	m.genSeq++
+	candidate.p.generation = m.genSeq
+	m.plugins[row.ID] = candidate.p
+	old := expected
+	m.mu.Unlock()
+
+	if old != nil {
+		destroyPlugin(row.ID, old)
+		log.Debug(ctx, "Reclaimed superseded plugin generation after settings commit",
+			"plugin", row.ID, "oldGeneration", old.generation, "newGeneration", candidate.p.generation)
+	}
 	return nil
+}
+
+// destroyPlugin releases the host services and compiled Wasm of a plugin
+// instance. Callers always pass the exact instance they detached (or never
+// published), so a slow request can never close a newer generation than the
+// one it replaced.
+func destroyPlugin(name string, p *plugin) {
+	if err := p.Close(); err != nil {
+		log.Error("Error during plugin cleanup", "plugin", name, err)
+	}
+
+	if p.compiled != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := p.compiled.Close(ctx); err != nil {
+			log.Error("Error closing plugin", "plugin", name, err)
+		}
+	}
+
+	runtime.GC()
 }
 
 // closeAll closes host service closers accumulated before a load failure,
