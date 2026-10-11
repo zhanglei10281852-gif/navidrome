@@ -10,6 +10,7 @@ import (
 	"github.com/deluan/rest"
 	"github.com/go-chi/chi/v5"
 	"github.com/navidrome/navidrome/consts"
+	"github.com/navidrome/navidrome/core/artwork"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/server"
 )
@@ -37,18 +38,21 @@ func (api *Router) uploadArtistImage() http.HandlerFunc {
 			}
 			return err
 		}
-		oldPath := ar.UploadedImagePath()
-		filename, err := api.imgUpload.SetImage(ctx, consts.EntityArtist, ar.ID, ar.Name, oldPath, reader, ext)
-		if err != nil {
-			return err
+		commit := artwork.CoverCommit{
+			Current: func(ctx context.Context) (string, error) {
+				current, err := api.ds.Artist().Get(ctx, artistID)
+				if err != nil {
+					return "", err
+				}
+				return current.UploadedImage, nil
+			},
+			Persist: func(ctx context.Context, filename string) error {
+				ar.UploadedImage = filename
+				ar.UpdatedAt = new(time.Now())
+				return api.ds.Artist().Put(ctx, ar, "uploaded_image", "updated_at")
+			},
 		}
-		ar.UploadedImage = filename
-		ar.UpdatedAt = new(time.Now())
-		if err := api.ds.Artist().Put(ctx, ar, "uploaded_image", "updated_at"); err != nil {
-			return err
-		}
-		api.imgUpload.EnqueueArtwork(ctx, consts.EntityArtist, ar.ID)
-		return nil
+		return api.imgUpload.SetImage(ctx, consts.EntityArtist, ar.ID, ar.Name, reader, ext, commit)
 	})
 }
 
@@ -62,15 +66,20 @@ func (api *Router) deleteArtistImage() http.HandlerFunc {
 			}
 			return err
 		}
-		if err := api.imgUpload.RemoveImage(ctx, ar.UploadedImagePath()); err != nil {
-			return err
+		commit := artwork.CoverCommit{
+			Current: func(ctx context.Context) (string, error) {
+				current, err := api.ds.Artist().Get(ctx, artistID)
+				if err != nil {
+					return "", err
+				}
+				return current.UploadedImage, nil
+			},
+			Persist: func(ctx context.Context, _ string) error {
+				ar.UploadedImage = ""
+				ar.UpdatedAt = new(time.Now())
+				return api.ds.Artist().Put(ctx, ar, "uploaded_image", "updated_at")
+			},
 		}
-		ar.UploadedImage = ""
-		ar.UpdatedAt = new(time.Now())
-		if err := api.ds.Artist().Put(ctx, ar, "uploaded_image", "updated_at"); err != nil {
-			return err
-		}
-		api.imgUpload.EnqueueArtwork(ctx, consts.EntityArtist, ar.ID)
-		return nil
+		return api.imgUpload.RemoveImage(ctx, consts.EntityArtist, ar.ID, commit)
 	})
 }

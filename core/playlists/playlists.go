@@ -12,6 +12,7 @@ import (
 	"github.com/deluan/rest"
 	"github.com/navidrome/navidrome/conf"
 	"github.com/navidrome/navidrome/consts"
+	"github.com/navidrome/navidrome/core/artwork"
 	"github.com/navidrome/navidrome/log"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/model/request"
@@ -53,12 +54,10 @@ type Playlists interface {
 	TracksRepository(ctx context.Context, playlistId string, refreshSmartPlaylist bool) rest.Repository[model.PlaylistTrack]
 }
 
-// ImageUploadService is a local interface satisfied by artwork.Uploader.
-// Defined here to avoid an import cycle between core/artwork and core/playlists.
+// ImageUploadService is the cover-commit contract satisfied by artwork.Uploader.
 type ImageUploadService interface {
-	SetImage(ctx context.Context, entityType string, entityID string, name string, oldPath string, reader io.Reader, ext string) (filename string, err error)
-	RemoveImage(ctx context.Context, path string) error
-	EnqueueArtwork(ctx context.Context, entityType, entityID string)
+	SetImage(ctx context.Context, entityType, entityID, name string, reader io.Reader, ext string, commit artwork.CoverCommit) error
+	RemoveImage(ctx context.Context, entityType, entityID string, commit artwork.CoverCommit) error
 }
 
 type playlists struct {
@@ -161,14 +160,19 @@ func (s *playlists) Delete(ctx context.Context, id string) error {
 		return err
 	}
 
-	// Clean up custom cover image file if one exists
-	if path := pls.UploadedImagePath(); path != "" {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			log.Warn(ctx, "Failed to remove playlist image on delete", "path", path, err)
+	// Remove the entity (and its image reference) before unlinking the cover file, so a failed
+	// deletion can never leave a row pointing at a missing file; the periodic sweep reclaims the
+	// file when the unlink fails.
+	coverPath := pls.UploadedImagePath()
+	if err := s.ds.Playlist().Delete(ctx, id); err != nil {
+		return err
+	}
+	if coverPath != "" {
+		if err := os.Remove(coverPath); err != nil && !os.IsNotExist(err) {
+			log.Warn(ctx, "Failed to remove playlist image on delete", "path", coverPath, err)
 		}
 	}
-
-	return s.ds.Playlist().Delete(ctx, id)
+	return nil
 }
 
 func (s *playlists) Update(ctx context.Context, playlistID string,
@@ -335,18 +339,14 @@ func (s *playlists) SetImage(ctx context.Context, playlistID string, reader io.R
 		return err
 	}
 
-	oldPath := pls.UploadedImagePath()
-	filename, err := s.imgUpload.SetImage(ctx, consts.EntityPlaylist, pls.ID, pls.Name, oldPath, reader, ext)
-	if err != nil {
-		return err
+	commit := artwork.CoverCommit{
+		Current: s.currentImage(playlistID),
+		Persist: func(ctx context.Context, filename string) error {
+			pls.UploadedImage = filename
+			return s.ds.Playlist().Put(ctx, pls)
+		},
 	}
-
-	pls.UploadedImage = filename
-	if err := s.ds.Playlist().Put(ctx, pls); err != nil {
-		return err
-	}
-	s.imgUpload.EnqueueArtwork(ctx, consts.EntityPlaylist, pls.ID)
-	return nil
+	return s.imgUpload.SetImage(ctx, consts.EntityPlaylist, pls.ID, pls.Name, reader, ext, commit)
 }
 
 func (s *playlists) RemoveImage(ctx context.Context, playlistID string) error {
@@ -355,14 +355,24 @@ func (s *playlists) RemoveImage(ctx context.Context, playlistID string) error {
 		return err
 	}
 
-	if err := s.imgUpload.RemoveImage(ctx, pls.UploadedImagePath()); err != nil {
-		return err
+	commit := artwork.CoverCommit{
+		Current: s.currentImage(playlistID),
+		Persist: func(ctx context.Context, _ string) error {
+			pls.UploadedImage = ""
+			return s.ds.Playlist().Put(ctx, pls)
+		},
 	}
+	return s.imgUpload.RemoveImage(ctx, consts.EntityPlaylist, pls.ID, commit)
+}
 
-	pls.UploadedImage = ""
-	if err := s.ds.Playlist().Put(ctx, pls); err != nil {
-		return err
+// currentImage returns a hook reading the playlist's persisted cover filename, so the commit
+// re-checks the live reference under its lock before reclaiming any file.
+func (s *playlists) currentImage(playlistID string) func(context.Context) (string, error) {
+	return func(ctx context.Context) (string, error) {
+		current, err := s.ds.Playlist().Get(ctx, playlistID)
+		if err != nil {
+			return "", err
+		}
+		return current.UploadedImage, nil
 	}
-	s.imgUpload.EnqueueArtwork(ctx, consts.EntityPlaylist, pls.ID)
-	return nil
 }

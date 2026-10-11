@@ -9,6 +9,7 @@ import (
 	"github.com/deluan/rest"
 	"github.com/go-chi/chi/v5"
 	"github.com/navidrome/navidrome/consts"
+	"github.com/navidrome/navidrome/core/artwork"
 	"github.com/navidrome/navidrome/model"
 	"github.com/navidrome/navidrome/server"
 )
@@ -39,17 +40,20 @@ func (api *Router) uploadRadioImage() http.HandlerFunc {
 			}
 			return err
 		}
-		oldPath := radio.UploadedImagePath()
-		filename, err := api.imgUpload.SetImage(ctx, consts.EntityRadio, radio.ID, radio.Name, oldPath, reader, ext)
-		if err != nil {
-			return err
+		commit := artwork.CoverCommit{
+			Current: func(ctx context.Context) (string, error) {
+				current, err := api.ds.Radio().Get(ctx, radioID)
+				if err != nil {
+					return "", err
+				}
+				return current.UploadedImage, nil
+			},
+			Persist: func(ctx context.Context, filename string) error {
+				radio.UploadedImage = filename
+				return api.ds.Radio().Put(ctx, radio, "UploadedImage")
+			},
 		}
-		radio.UploadedImage = filename
-		if err := api.ds.Radio().Put(ctx, radio, "UploadedImage"); err != nil {
-			return err
-		}
-		api.imgUpload.EnqueueArtwork(ctx, consts.EntityRadio, radio.ID)
-		return nil
+		return api.imgUpload.SetImage(ctx, consts.EntityRadio, radio.ID, radio.Name, reader, ext, commit)
 	})
 }
 
@@ -63,14 +67,19 @@ func (api *Router) deleteRadioImage() http.HandlerFunc {
 			}
 			return err
 		}
-		if err := api.imgUpload.RemoveImage(ctx, radio.UploadedImagePath()); err != nil {
-			return err
+		commit := artwork.CoverCommit{
+			Current: func(ctx context.Context) (string, error) {
+				current, err := api.ds.Radio().Get(ctx, radioID)
+				if err != nil {
+					return "", err
+				}
+				return current.UploadedImage, nil
+			},
+			Persist: func(ctx context.Context, _ string) error {
+				radio.UploadedImage = ""
+				return api.ds.Radio().Put(ctx, radio, "UploadedImage")
+			},
 		}
-		radio.UploadedImage = ""
-		if err := api.ds.Radio().Put(ctx, radio, "UploadedImage"); err != nil {
-			return err
-		}
-		api.imgUpload.EnqueueArtwork(ctx, consts.EntityRadio, radio.ID)
-		return nil
+		return api.imgUpload.RemoveImage(ctx, consts.EntityRadio, radio.ID, commit)
 	})
 }

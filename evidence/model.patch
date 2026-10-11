@@ -1,0 +1,1165 @@
+diff --git a/core/artwork/prune.go b/core/artwork/prune.go
+index 15b4a5673..784598a67 100644
+--- a/core/artwork/prune.go
++++ b/core/artwork/prune.go
+@@ -59,5 +59,15 @@ func prune(ctx context.Context, ds model.DataStore, store *ImageStore) error {
+ 	if removed > 0 {
+ 		log.Info(ctx, "Artwork: Swept stray files", "count", removed)
+ 	}
++
++	// Reclaim upload candidates from crashed commits and covers no entity references. The same
++	// grace window protects a commit between publication and reference persistence.
++	uploadsRemoved, err := sweepUploadedImages(ctx, ds, cutoff)
++	if err != nil {
++		return err
++	}
++	if uploadsRemoved > 0 {
++		log.Info(ctx, "Artwork: Reclaimed unreferenced uploaded images", "count", uploadsRemoved)
++	}
+ 	return nil
+ }
+diff --git a/core/artwork/uploader.go b/core/artwork/uploader.go
+index 76526af3c..5b4ce5481 100644
+--- a/core/artwork/uploader.go
++++ b/core/artwork/uploader.go
+@@ -2,10 +2,15 @@ package artwork
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"io"
++	"io/fs"
+ 	"os"
+ 	"path/filepath"
++	"strings"
++	"sync"
++	"time"
+ 
+ 	"github.com/dustin/go-humanize"
+ 	"github.com/navidrome/navidrome/conf"
+@@ -28,12 +33,29 @@ func parseSize(value, fallback string) int64 {
+ 	return int64(size)
+ }
+ 
+-// Uploader stores a user-uploaded entity image and invalidates that entity's artwork state.
++// CoverCommit carries the per-entity persistence hooks that drive one recoverable cover
++// change (replacement or removal). The Uploader owns file staging, reference publication and
++// artwork-state ordering; the hooks only touch the entity row.
++type CoverCommit struct {
++	// Current returns the uploaded-image filename persisted on the entity right now ("" if none).
++	Current func(ctx context.Context) (string, error)
++	// Persist stores filename as the entity's cover reference; "" clears it. It must be safe to
++	// call from the serialized cover commit, and durable by the time it returns nil.
++	Persist func(ctx context.Context, filename string) error
++}
++
++// Uploader stores a user-uploaded entity image through a recoverable commit and refreshes the
++// entity's artwork state so resolution and reads converge on the new reference.
+ type Uploader interface {
+-	SetImage(ctx context.Context, entityType string, entityID string, name string, oldPath string, reader io.Reader, ext string) (filename string, err error)
+-	RemoveImage(ctx context.Context, path string) error
+-	// EnqueueArtwork re-resolves the item's artwork. Call it AFTER persisting the new
+-	// filename, or the worker resolves the old one.
++	// SetImage runs one atomic, recoverable cover replacement: the upload is fully written to a
++	// candidate first, the complete image is published, and the entity reference is persisted;
++	// until the reference is durable, clients and resolution keep seeing the previous cover.
++	SetImage(ctx context.Context, entityType, entityID, name string, reader io.Reader, ext string, commit CoverCommit) error
++	// RemoveImage persists the empty reference first, refreshes artwork state, and only then
++	// unlinks the file, so the database can never name a deleted image.
++	RemoveImage(ctx context.Context, entityType, entityID string, commit CoverCommit) error
++	// EnqueueArtwork re-resolves the item's artwork. Call it AFTER persisting a new filename
++	// outside a SetImage commit, or the worker resolves the old one.
+ 	EnqueueArtwork(ctx context.Context, entityType, entityID string)
+ }
+ 
+@@ -43,6 +65,18 @@ var uploadEntityKind = map[string]model.Kind{
+ 	consts.EntityRadio:    model.KindRadioArtwork,
+ }
+ 
++// uploadCoverFileMode matches the mode the previous direct os.Create uploads settled to under
++// the usual process umask, so first-upload file semantics do not change.
++const uploadCoverFileMode = 0o644
++
++// stagedCandidateTail marks an upload candidate: names look like ".<final>.tmp<random>".
++// The leading dot and non-image tail also keep resolution from ever opening a candidate.
++const stagedCandidateTail = ".tmp*"
++
++func isStagedCandidate(name string) bool {
++	return strings.HasPrefix(name, ".") && strings.Contains(name, strings.TrimSuffix(stagedCandidateTail, "*"))
++}
++
+ type uploader struct {
+ 	ds model.DataStore
+ }
+@@ -51,30 +85,236 @@ func NewUploader(ds model.DataStore) Uploader {
+ 	return &uploader{ds: ds}
+ }
+ 
+-func (s *uploader) SetImage(ctx context.Context, entityType string, entityID string, name string, oldPath string, reader io.Reader, ext string) (string, error) {
++// stagedCover is one fully-written candidate file awaiting its atomic publication.
++type stagedCover struct {
++	tmpPath   string
++	finalPath string
++	// mtime captured after the complete write; rename preserves it, so a later commit that
++	// replaced the same final path is detectable.
++	mtime time.Time
++}
++
++// stageCover copies the whole upload into a uniquely named candidate in the target directory
++// and closes it before returning. A failed stream never leaves readable bytes at a cover name.
++func stageCover(ctx context.Context, finalPath string, reader io.Reader) (*stagedCover, error) {
++	dir := filepath.Dir(finalPath)
++	if err := os.MkdirAll(dir, 0o755); err != nil {
++		return nil, fmt.Errorf("creating image directory: %w", err)
++	}
++	tmp, err := os.CreateTemp(dir, "."+filepath.Base(finalPath)+stagedCandidateTail)
++	if err != nil {
++		return nil, fmt.Errorf("creating image file: %w", err)
++	}
++	tmpName := tmp.Name()
++	if _, err := io.Copy(tmp, reader); err != nil {
++		_ = tmp.Close()
++		_ = os.Remove(tmpName)
++		return nil, fmt.Errorf("writing image file: %w", err)
++	}
++	if err := tmp.Close(); err != nil {
++		_ = os.Remove(tmpName)
++		return nil, fmt.Errorf("writing image file: %w", err)
++	}
++	// CreateTemp modes files 0600; match the historical upload mode and ignore a chmod failure
++	// (the file is still readable by this process and gets reclaimed on the next sweep).
++	if err := os.Chmod(tmpName, uploadCoverFileMode); err != nil {
++		log.Warn(ctx, "Artwork: Could not chmod staged image", "path", tmpName, err)
++	}
++	info, err := os.Stat(tmpName)
++	if err != nil {
++		_ = os.Remove(tmpName)
++		return nil, fmt.Errorf("stating staged image file: %w", err)
++	}
++	return &stagedCover{tmpPath: tmpName, finalPath: finalPath, mtime: info.ModTime()}, nil
++}
++
++// publish atomically places the complete candidate at its final name.
++func (c *stagedCover) publish() error {
++	if err := os.Rename(c.tmpPath, c.finalPath); err != nil {
++		return err
++	}
++	c.tmpPath = ""
++	return nil
++}
++
++// discard removes a candidate that never published; an already-published candidate lives at
++// its final name and is handled by commit rollback/reclaim instead.
++func (c *stagedCover) discard(ctx context.Context) {
++	if c == nil || c.tmpPath == "" {
++		return
++	}
++	if err := os.Remove(c.tmpPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
++		log.Warn(ctx, "Artwork: Could not remove staged image; periodic sweep will retry",
++			"path", c.tmpPath, err)
++	}
++}
++
++func (s *uploader) SetImage(ctx context.Context, entityType, entityID, name string, reader io.Reader, ext string, commit CoverCommit) error {
+ 	filename := imageFilename(entityID, name, ext)
+-	absPath := model.UploadedImagePath(entityType, filename)
++	finalPath := model.UploadedImagePath(entityType, filename)
+ 
+-	if err := os.MkdirAll(filepath.Dir(absPath), 0755); err != nil {
+-		return "", fmt.Errorf("creating image directory: %w", err)
++	unlock := lockCover(entityType, entityID)
++	defer unlock()
++
++	current, err := commit.Current(ctx)
++	if err != nil {
++		return err
+ 	}
++	oldPath := model.UploadedImagePath(entityType, current)
++	oldMtime := mtimeOf(oldPath)
++	// Same name and extension: publishing would overwrite the bytes the old reference names,
++	// so this case persists the reference first and publishes only once it is durable.
++	inPlace := oldPath != "" && oldPath == finalPath
+ 
+-	if oldPath != "" {
+-		if err := os.Remove(oldPath); err != nil && !os.IsNotExist(err) {
+-			log.Warn(ctx, "Artwork: Failed to remove old image", "path", oldPath, err)
++	staged, err := stageCover(ctx, finalPath, reader)
++	if err != nil {
++		return err
++	}
++
++	// Phase 1 (distinct paths): publish before persisting. The reference still names the old,
++	// untouched file, so every reader keeps serving the previous cover.
++	published := false
++	if !inPlace {
++		if err := staged.publish(); err != nil {
++			staged.discard(ctx)
++			return fmt.Errorf("publishing image file: %w", err)
+ 		}
++		published = true
+ 	}
+ 
+-	f, err := os.Create(absPath)
++	// Phase 2: persist the entity reference.
++	if err := commit.Persist(ctx, filename); err != nil {
++		if published {
++			s.rollbackPublished(ctx, entityType, filename, staged.finalPath, staged.mtime, commit)
++		} else {
++			staged.discard(ctx)
++		}
++		return err
++	}
++
++	// Phase 1 (in place): the reference already names this path, so publishing now exposes only
++	// the complete new image, never a partial one.
++	if inPlace {
++		if err := staged.publish(); err != nil {
++			// The stored filename is unchanged and the old complete file still backs it, so the
++			// reference stays coherent; drop the candidate and let the client retry.
++			staged.discard(ctx)
++			return fmt.Errorf("publishing image file: %w", err)
++		}
++	}
++
++	// Phase 3: drop resolved state and re-queue so resolution converges on the new reference.
++	stateCleared := s.refreshArtwork(ctx, entityType, entityID)
++
++	// Phase 4: reclaim the replaced file once nothing can still read it.
++	s.reclaimSuperseded(ctx, entityType, oldPath, finalPath, oldMtime, stateCleared, commit)
++	return nil
++}
++
++func (s *uploader) RemoveImage(ctx context.Context, entityType, entityID string, commit CoverCommit) error {
++	unlock := lockCover(entityType, entityID)
++	defer unlock()
++
++	current, err := commit.Current(ctx)
+ 	if err != nil {
+-		return "", fmt.Errorf("creating image file: %w", err)
++		return err
+ 	}
+-	defer f.Close()
++	oldPath := model.UploadedImagePath(entityType, current)
++	oldMtime := mtimeOf(oldPath)
+ 
+-	if _, err := io.Copy(f, reader); err != nil {
+-		return "", fmt.Errorf("writing image file: %w", err)
++	// Persist the empty reference first, so a failed update leaves a readable image and the
++	// database never names a file that was deleted.
++	if err := commit.Persist(ctx, ""); err != nil {
++		return err
++	}
++
++	// Clear resolved state before unlinking: readers then resolve the non-custom sources
++	// instead of hitting a dangling path.
++	stateCleared := s.refreshArtwork(ctx, entityType, entityID)
++	if oldPath == "" {
++		return nil
++	}
++	// A concurrent replacement may have committed this exact reference again after our persist.
++	if current, err := commit.Current(ctx); err == nil && model.UploadedImagePath(entityType, current) == oldPath {
++		return nil
++	}
++	if !stateCleared {
++		// item_artwork may still serve these bytes; the periodic sweep reclaims after convergence.
++		return nil
++	}
++	if info, err := os.Stat(oldPath); err != nil || (oldMtime != 0 && info.ModTime().UnixNano() != oldMtime) {
++		return nil
++	}
++	if err := os.Remove(oldPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
++		// The reference is already gone, so this cannot dangle; the sweep finishes the unlink.
++		log.Warn(ctx, "Artwork: Could not remove deleted cover file; periodic sweep will retry",
++			"path", oldPath, err)
+ 	}
+-	return filename, nil
++	return nil
++}
++
++// rollbackPublished undoes a publish whose entity reference failed to persist. The fresh file is
++// removed only while it is still the bytes this request wrote and no reference names it, so a
++// concurrent or retried submission that committed later never loses its image.
++func (s *uploader) rollbackPublished(ctx context.Context, entityType, filename, finalPath string, mtime time.Time, commit CoverCommit) {
++	if current, err := commit.Current(ctx); err == nil && current == filename {
++		return // another attempt already persisted this reference
++	}
++	info, err := os.Stat(finalPath)
++	if err != nil {
++		return
++	}
++	if !info.ModTime().Equal(mtime) {
++		return // the file was replaced after our publish
++	}
++	if err := os.Remove(finalPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
++		log.Warn(ctx, "Artwork: Could not roll back unpersisted image; periodic sweep will retry",
++			"path", finalPath, err)
++	}
++}
++
++// reclaimSuperseded unlinks the previous cover once the commit is complete and the old file is
++// unreferenced by both the entity and the resolved-state row. Every guard re-checks live state,
++// so a later successful submission cannot have its image deleted.
++func (s *uploader) reclaimSuperseded(ctx context.Context, entityType, oldPath, finalPath string, oldMtime int64, stateCleared bool, commit CoverCommit) {
++	if oldPath == "" || oldPath == finalPath || !stateCleared {
++		return
++	}
++	if current, err := commit.Current(ctx); err == nil && model.UploadedImagePath(entityType, current) == oldPath {
++		return
++	}
++	info, err := os.Stat(oldPath)
++	if err != nil || (oldMtime != 0 && info.ModTime().UnixNano() != oldMtime) {
++		return
++	}
++	if err := os.Remove(oldPath); err != nil && !errors.Is(err, fs.ErrNotExist) {
++		log.Warn(ctx, "Artwork: Superseded image kept; periodic sweep will retry", "path", oldPath, err)
++	}
++}
++
++// refreshArtwork drops the item's resolved state and enqueues a Bump re-resolution. It reports
++// whether the state clear succeeded: only cleared state can leave an old backing file unreferenced.
++// The enqueue is still attempted when the clear failed — the worker upserts fresh state, which
++// drives resolution to the new reference even without the delete.
++func (s *uploader) refreshArtwork(ctx context.Context, entityType, id string) (stateCleared bool) {
++	kind, ok := uploadEntityKind[entityType]
++	if !ok {
++		return false
++	}
++	if err := s.ds.Artwork().DeleteForItems(ctx, kind, []string{id}); err != nil {
++		log.Warn(ctx, "Artwork: Could not clear artwork state after cover change", "kind", kind, "id", id, err)
++	} else {
++		stateCleared = true
++	}
++	item := model.ArtworkQueueItem{
++		ItemKind: kind.Prefix(), ItemID: id,
++		ImageType: model.ImageTypePrimary, Priority: model.ArtworkPriorityBump,
++	}
++	if err := s.ds.ArtworkQueue().Enqueue(ctx, item); err != nil {
++		// Request-time read-through resolves the new reference and re-enqueues itself.
++		log.Warn(ctx, "Artwork: Could not enqueue artwork refresh after cover change", "kind", kind, "id", id, err)
++	}
++	return stateCleared
+ }
+ 
+ func (s *uploader) EnqueueArtwork(ctx context.Context, entityType, id string) {
+@@ -87,14 +327,26 @@ func (s *uploader) EnqueueArtwork(ctx context.Context, entityType, id string) {
+ 	}
+ }
+ 
+-func (s *uploader) RemoveImage(ctx context.Context, path string) error {
+-	if path == "" {
+-		return nil
+-	}
+-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+-		return fmt.Errorf("removing image %q: %w", path, err)
++// cover locks serialize commits for one entity within this process, so concurrent or retried
++// replacements cannot interleave staging, persistence and old-file reclamation.
++var (
++	coverLocksMu sync.Mutex
++	coverLocks   = map[string]*coverMutex{}
++)
++
++type coverMutex struct{ sync.Mutex }
++
++func lockCover(entityType, entityID string) (unlock func()) {
++	key := entityType + "\x00" + entityID
++	coverLocksMu.Lock()
++	mu, ok := coverLocks[key]
++	if !ok {
++		mu = &coverMutex{}
++		coverLocks[key] = mu
+ 	}
+-	return nil
++	coverLocksMu.Unlock()
++	mu.Lock()
++	return mu.Unlock
+ }
+ 
+ func imageFilename(id, name, ext string) string {
+@@ -104,3 +356,97 @@ func imageFilename(id, name, ext string) string {
+ 	}
+ 	return id + "_" + clean + ext
+ }
++
++// uploadedImageEntities lists the entity types whose covers live under <data>/artwork/<type>.
++var uploadedImageEntities = []string{consts.EntityArtist, consts.EntityPlaylist, consts.EntityRadio}
++
++// sweepUploadedImages reclaims cover candidates left by crashed/restarted submissions and
++// uploaded files no entity references anymore. Anything younger than cutoff is spared: a commit
++// can be between its publication and its reference persistence. It is the safety net behind the
++// commit's own reclamation; the common case is unlinked inline.
++func sweepUploadedImages(ctx context.Context, ds model.DataStore, cutoff time.Time) (int, error) {
++	removed := 0
++	for _, entityType := range uploadedImageEntities {
++		live, err := liveUploadedFilenames(ctx, ds, entityType)
++		if err != nil {
++			return removed, err
++		}
++		dir := filepath.Join(conf.Server.DataFolder.String(), consts.ArtworkFolder, entityType)
++		entries, err := os.ReadDir(dir)
++		if errors.Is(err, fs.ErrNotExist) {
++			continue
++		}
++		if err != nil {
++			return removed, err
++		}
++		for _, entry := range entries {
++			if entry.IsDir() {
++				continue
++			}
++			info, err := entry.Info()
++			if err != nil || info.ModTime().After(cutoff) {
++				continue
++			}
++			name := entry.Name()
++			// Candidates are never named by a reference, so they are not kept by the live set.
++			if !isStagedCandidate(name) {
++				if _, ok := live[name]; ok {
++					continue
++				}
++			}
++			if err := os.Remove(filepath.Join(dir, name)); err != nil {
++				if !errors.Is(err, fs.ErrNotExist) {
++					log.Warn(ctx, "Artwork: Could not sweep unreferenced upload", "path", name, err)
++				}
++				continue
++			}
++			removed++
++		}
++	}
++	return removed, nil
++}
++
++// liveUploadedFilenames is the set of cover filenames currently referenced by entities.
++func liveUploadedFilenames(ctx context.Context, ds model.DataStore, entityType string) (map[string]struct{}, error) {
++	live := make(map[string]struct{})
++	add := func(name string) {
++		if name != "" {
++			live[name] = struct{}{}
++		}
++	}
++	switch entityType {
++	case consts.EntityArtist:
++		cursor, err := ds.Artist().GetCursor(ctx)
++		if err != nil {
++			return nil, err
++		}
++		for artist, err := range cursor {
++			if err != nil {
++				return nil, err
++			}
++			add(artist.UploadedImage)
++		}
++	case consts.EntityPlaylist:
++		cursor, err := ds.Playlist().GetCursor(ctx)
++		if err != nil {
++			return nil, err
++		}
++		for pls, err := range cursor {
++			if err != nil {
++				return nil, err
++			}
++			add(pls.UploadedImage)
++		}
++	case consts.EntityRadio:
++		radios, err := ds.Radio().GetAll(ctx)
++		if err != nil {
++			return nil, err
++		}
++		for _, radio := range radios {
++			add(radio.UploadedImage)
++		}
++	default:
++		return nil, fmt.Errorf("artwork: unsupported upload entity %q", entityType)
++	}
++	return live, nil
++}
+diff --git a/core/artwork/uploader_test.go b/core/artwork/uploader_test.go
+index b1420c935..e7e5be668 100644
+--- a/core/artwork/uploader_test.go
++++ b/core/artwork/uploader_test.go
+@@ -2,9 +2,12 @@ package artwork
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"os"
+ 	"path/filepath"
+ 	"strings"
++	"sync"
++	"time"
+ 
+ 	"github.com/navidrome/navidrome/conf"
+ 	"github.com/navidrome/navidrome/conf/configtest"
+@@ -15,12 +18,58 @@ import (
+ 	. "github.com/onsi/gomega"
+ )
+ 
++// refStore is the in-memory entity behind a CoverCommit in the tests.
++type refStore struct {
++	mu         sync.Mutex
++	current    string
++	persistErr error
++	persisted  []string
++}
++
++func (r *refStore) hooks() CoverCommit {
++	return CoverCommit{
++		Current: func(context.Context) (string, error) {
++			r.mu.Lock()
++			defer r.mu.Unlock()
++			return r.current, nil
++		},
++		Persist: func(_ context.Context, filename string) error {
++			r.mu.Lock()
++			defer r.mu.Unlock()
++			r.persisted = append(r.persisted, filename)
++			if r.persistErr != nil {
++				return r.persistErr
++			}
++			r.current = filename
++			return nil
++		},
++	}
++}
++
++// failingReader returns some bytes and then an error, simulating a stream that dies mid-upload.
++type failingReader struct {
++	remaining int
++}
++
++func (f *failingReader) Read(p []byte) (int, error) {
++	if f.remaining <= 0 {
++		return 0, errors.New("connection reset by peer")
++	}
++	n := min(len(p), f.remaining)
++	for i := range n {
++		p[i] = 'x'
++	}
++	f.remaining -= n
++	return n, nil
++}
++
+ var _ = Describe("Uploader", func() {
+ 	var ctx context.Context
+ 	var svc Uploader
+ 	var tmpDir string
+ 	var artRepo *tests.MockArtworkRepo
+ 	var queueRepo *tests.MockArtworkQueueRepo
++	var ds *tests.MockDataStore
+ 
+ 	BeforeEach(func() {
+ 		ctx = GinkgoT().Context()
+@@ -29,64 +78,258 @@ var _ = Describe("Uploader", func() {
+ 		conf.Server.DataFolder = conf.NewDir(tmpDir)
+ 		artRepo = tests.CreateMockArtworkRepo()
+ 		queueRepo = tests.CreateMockArtworkQueueRepo()
+-		ds := &tests.MockDataStore{MockedArtwork: artRepo, MockedArtworkQueue: queueRepo}
++		ds = &tests.MockDataStore{MockedArtwork: artRepo, MockedArtworkQueue: queueRepo}
+ 		svc = NewUploader(ds)
+ 	})
+ 
++	artistFile := func(filename string) string {
++		return filepath.Join(tmpDir, "artwork", "artist", filename)
++	}
++
++	expectBumpQueued := func(entityID string) {
++		queued, err := queueRepo.DequeueBatch(ctx, 1000)
++		Expect(err).ToNot(HaveOccurred())
++		Expect(queued).To(ContainElement(SatisfyAll(
++			HaveField("ItemKind", model.KindArtistArtwork.Prefix()),
++			HaveField("ItemID", entityID),
++			HaveField("Priority", model.ArtworkPriorityBump),
++		)))
++	}
++
++	writeOld := func(filename, bytes string) string {
++		path := artistFile(filename)
++		Expect(os.MkdirAll(filepath.Dir(path), 0o755)).To(Succeed())
++		Expect(os.WriteFile(path, []byte(bytes), 0o600)).To(Succeed())
++		return path
++	}
++
+ 	Describe("SetImage", func() {
+-		It("creates directory and saves image file", func() {
+-			reader := strings.NewReader("fake image data")
+-			filename, err := svc.SetImage(ctx, consts.EntityArtist, "ar-1", "Pink Floyd", "", reader, ".jpg")
++		It("creates directory and saves image file on first upload", func() {
++			store := &refStore{}
++			err := svc.SetImage(ctx, consts.EntityArtist, "ar-1", "Pink Floyd", strings.NewReader("fake image data"), ".jpg", store.hooks())
+ 			Expect(err).ToNot(HaveOccurred())
+-			Expect(filename).To(Equal("ar-1_pink_floyd.jpg"))
++			Expect(store.current).To(Equal("ar-1_pink_floyd.jpg"))
+ 
+-			absPath := filepath.Join(tmpDir, "artwork", "artist", "ar-1_pink_floyd.jpg")
+-			data, err := os.ReadFile(absPath)
++			data, err := os.ReadFile(artistFile("ar-1_pink_floyd.jpg"))
+ 			Expect(err).ToNot(HaveOccurred())
+ 			Expect(string(data)).To(Equal("fake image data"))
++			expectBumpQueued("ar-1")
+ 		})
+ 
+ 		It("falls back to ID-only filename when name cleans to empty", func() {
+-			reader := strings.NewReader("data")
+-			filename, err := svc.SetImage(ctx, consts.EntityPlaylist, "pl-1", "!!!", "", reader, ".png")
++			store := &refStore{}
++			err := svc.SetImage(ctx, consts.EntityPlaylist, "pl-1", "!!!", strings.NewReader("data"), ".png", store.hooks())
+ 			Expect(err).ToNot(HaveOccurred())
+-			Expect(filename).To(Equal("pl-1.png"))
++			Expect(store.current).To(Equal("pl-1.png"))
++			Expect(filepath.Join(tmpDir, "artwork", "playlist", "pl-1.png")).To(BeAnExistingFile())
+ 		})
+ 
+-		It("removes old image when replacing", func() {
+-			oldDir := filepath.Join(tmpDir, "artwork", "artist")
+-			Expect(os.MkdirAll(oldDir, 0755)).To(Succeed())
+-			oldFile := filepath.Join(oldDir, "ar-1_old.png")
+-			Expect(os.WriteFile(oldFile, []byte("old"), 0600)).To(Succeed())
++		It("removes the old image after a replacement commit", func() {
++			oldFile := writeOld("ar-1_old.png", "old")
++			store := &refStore{current: "ar-1_old.png"}
+ 
+-			reader := strings.NewReader("new image")
+-			_, err := svc.SetImage(ctx, consts.EntityArtist, "ar-1", "New Name", oldFile, reader, ".jpg")
+-			Expect(err).ToNot(HaveOccurred())
+-			Expect(oldFile).ToNot(BeAnExistingFile())
++			Expect(svc.SetImage(ctx, consts.EntityArtist, "ar-1", "New Name", strings.NewReader("new image"), ".jpg", store.hooks())).
++				To(Succeed())
+ 
+-			newPath := filepath.Join(oldDir, "ar-1_new_name.jpg")
++			Expect(oldFile).ToNot(BeAnExistingFile())
++			newPath := artistFile("ar-1_new_name.jpg")
+ 			Expect(newPath).To(BeAnExistingFile())
++			data, err := os.ReadFile(newPath)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(string(data)).To(Equal("new image"))
++			Expect(store.current).To(Equal("ar-1_new_name.jpg"))
++		})
++
++		It("keeps the old cover and leaves no candidate when the upload stream fails", func() {
++			oldFile := writeOld("ar-1_old.png", "old-bytes")
++			store := &refStore{current: "ar-1_old.png"}
++
++			err := svc.SetImage(ctx, consts.EntityArtist, "ar-1", "New Name", &failingReader{remaining: 100}, ".jpg", store.hooks())
++			Expect(err).To(MatchError(ContainSubstring("writing image file")))
++
++			// Old cover is still fully readable.
++			data, err := os.ReadFile(oldFile)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(string(data)).To(Equal("old-bytes"))
++			// Reference untouched, no state refresh, no half-written final or candidate file.
++			Expect(store.current).To(Equal("ar-1_old.png"))
++			Expect(store.persisted).To(BeEmpty())
++			Expect(artistFile("ar-1_new_name.jpg")).ToNot(BeAnExistingFile())
++			entries, err := os.ReadDir(filepath.Dir(oldFile))
++			Expect(err).ToNot(HaveOccurred())
++			for _, e := range entries {
++				Expect(e.Name()).ToNot(HavePrefix("."))
++			}
++			Expect(queueRepo.DequeueBatch(ctx, 1000)).To(BeEmpty())
+ 		})
+ 
+-		It("ignores missing old file without error", func() {
+-			reader := strings.NewReader("data")
+-			_, err := svc.SetImage(ctx, consts.EntityArtist, "ar-1", "Name", "/nonexistent/path.jpg", reader, ".jpg")
++		It("rolls the new file back when persisting the reference fails (different name)", func() {
++			oldFile := writeOld("ar-1_old.png", "old-bytes")
++			store := &refStore{current: "ar-1_old.png", persistErr: errors.New("db is down")}
++
++			err := svc.SetImage(ctx, consts.EntityArtist, "ar-1", "New Name", strings.NewReader("new image"), ".jpg", store.hooks())
++			Expect(err).To(MatchError(ContainSubstring("db is down")))
++
++			Expect(artistFile("ar-1_new_name.jpg")).ToNot(BeAnExistingFile(), "unpersisted publish must be rolled back")
++			data, err := os.ReadFile(oldFile)
+ 			Expect(err).ToNot(HaveOccurred())
++			Expect(string(data)).To(Equal("old-bytes"))
++			Expect(queueRepo.DequeueBatch(ctx, 1000)).To(BeEmpty(), "no refresh on a failed commit")
++		})
++
++		It("keeps the old bytes coherent when an in-place replacement fails to persist", func() {
++			final := writeOld("ar-1_name.jpg", "old-bytes")
++			store := &refStore{current: "ar-1_name.jpg", persistErr: errors.New("db is down")}
++
++			err := svc.SetImage(ctx, consts.EntityArtist, "ar-1", "Name", strings.NewReader("new image"), ".jpg", store.hooks())
++			Expect(err).To(HaveOccurred())
++
++			data, err := os.ReadFile(final)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(string(data)).To(Equal("old-bytes"), "same-path reference must keep serving the old complete image")
++			entries, err := os.ReadDir(filepath.Dir(final))
++			Expect(err).ToNot(HaveOccurred())
++			for _, e := range entries {
++				Expect(e.Name()).ToNot(HavePrefix("."))
++			}
++		})
++
++		It("does not delete a later successful commit's file when rolling back", func() {
++			// First read sees the old name; the re-check during rollback sees the new name, as if
++			// a concurrent retried submission committed in between.
++			oldFile := writeOld("ar-1_old.png", "old")
++			reads := 0
++			commit := CoverCommit{
++				Current: func(context.Context) (string, error) {
++					reads++
++					if reads == 1 {
++						return "ar-1_old.png", nil
++					}
++					return "ar-1_new_name.jpg", nil
++				},
++				Persist: func(context.Context, string) error { return errors.New("db is down") },
++			}
++
++			Expect(svc.SetImage(ctx, consts.EntityArtist, "ar-1", "New Name", strings.NewReader("new image"), ".jpg", commit)).
++				To(HaveOccurred())
++
++			Expect(oldFile).To(BeAnExistingFile())
++			Expect(artistFile("ar-1_new_name.jpg")).To(BeAnExistingFile(), "a reference now names this file")
+ 		})
+ 
+-		It("does not touch artwork state or the queue (that is EnqueueArtwork's job, post-Put)", func() {
++		It("atomically replaces the same path and refreshes state on an in-place success", func() {
++			final := writeOld("ar-1_name.jpg", "old-bytes")
+ 			Expect(artRepo.PutItemArtwork(ctx, &model.ItemArtwork{
+-				ItemKind: "ar", ItemID: "ar-1", Hash: "oldhash", Source: "external",
++				ItemKind: model.KindArtistArtwork.Prefix(), ItemID: "ar-1",
++				Hash: "oldhash", Source: "upload", SourcePath: final,
+ 			})).To(Succeed())
++			store := &refStore{current: "ar-1_name.jpg"}
+ 
+-			_, err := svc.SetImage(ctx, consts.EntityArtist, "ar-1", "Pink Floyd", "", strings.NewReader("img"), ".jpg")
+-			Expect(err).ToNot(HaveOccurred())
++			Expect(svc.SetImage(ctx, consts.EntityArtist, "ar-1", "Name", strings.NewReader("brand-new-bytes"), ".jpg", store.hooks())).
++				To(Succeed())
+ 
+-			// SetImage only writes the file; the state row survives and nothing is queued until
+-			// the caller has persisted the new filename and called EnqueueArtwork.
++			data, err := os.ReadFile(final)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(string(data)).To(Equal("brand-new-bytes"))
+ 			_, err = artRepo.GetItemArtwork(ctx, model.KindArtistArtwork, "ar-1", model.ImageTypePrimary)
++			Expect(err).To(MatchError(model.ErrNotFound))
++			expectBumpQueued("ar-1")
++		})
++
++		It("serializes concurrent replacements: the final file is always one complete image", func() {
++			writeOld("ar-1_name.jpg", strings.Repeat("o", 4096))
++			payloads := map[string]bool{}
++			for _, b := range []string{"A", "B", "C", "D"} {
++				payloads[strings.Repeat(b, 8192)] = true
++			}
++
++			var wg sync.WaitGroup
++			errs := make(chan error, 4)
++			for b := range payloads {
++				wg.Add(1)
++				go func(payload string) {
++					defer wg.Done()
++					store := &refStore{}
++					commit := store.hooks()
++					// Every goroutine replaces the same reference; the lock orders them.
++					commit.Current = func(context.Context) (string, error) { return "ar-1_name.jpg", nil }
++					commit.Persist = func(_ context.Context, filename string) error {
++						store.current = filename
++						return nil
++					}
++					errs <- svc.SetImage(ctx, consts.EntityArtist, "ar-1", "Name", strings.NewReader(payload), ".jpg", commit)
++				}(b)
++			}
++			wg.Wait()
++			close(errs)
++			for err := range errs {
++				Expect(err).ToNot(HaveOccurred())
++			}
++
++			final := artistFile("ar-1_name.jpg")
++			data, err := os.ReadFile(final)
+ 			Expect(err).ToNot(HaveOccurred())
+-			Expect(queueRepo.DequeueBatch(ctx, 1000)).To(BeEmpty())
++			Expect(payloads[string(data)]).To(BeTrue(), "no mixed or partial bytes from interleaved writes")
++			entries, err := os.ReadDir(filepath.Dir(final))
++			Expect(err).ToNot(HaveOccurred())
++			for _, e := range entries {
++				Expect(e.Name()).ToNot(HavePrefix("."))
++			}
++		})
++	})
++
++	Describe("RemoveImage", func() {
++		It("clears the reference while the file still exists, then removes the file", func() {
++			path := writeOld("ar-1_test.jpg", "img")
++			fileThereDuringPersist := false
++			store := &refStore{current: "ar-1_test.jpg"}
++			commit := store.hooks()
++			commit.Persist = func(ctx context.Context, filename string) error {
++				if _, err := os.Stat(path); err == nil {
++					fileThereDuringPersist = true
++				}
++				return store.hooks().Persist(ctx, filename)
++			}
++
++			Expect(svc.RemoveImage(ctx, consts.EntityArtist, "ar-1", commit)).To(Succeed())
++			Expect(fileThereDuringPersist).To(BeTrue(), "DB clear must happen before unlink")
++			Expect(path).ToNot(BeAnExistingFile())
++			Expect(store.current).To(BeEmpty())
++			_, err := artRepo.GetItemArtwork(ctx, model.KindArtistArtwork, "ar-1", model.ImageTypePrimary)
++			Expect(err).To(MatchError(model.ErrNotFound))
++			expectBumpQueued("ar-1")
++		})
++
++		It("keeps the file when the reference cannot be persisted", func() {
++			path := writeOld("ar-1_test.jpg", "img")
++			store := &refStore{current: "ar-1_test.jpg", persistErr: errors.New("db is down")}
++
++			err := svc.RemoveImage(ctx, consts.EntityArtist, "ar-1", store.hooks())
++			Expect(err).To(MatchError(ContainSubstring("db is down")))
++			Expect(path).To(BeAnExistingFile())
++			Expect(store.current).To(Equal("ar-1_test.jpg"))
++		})
++
++		It("succeeds with no current image and still refreshes state", func() {
++			Expect(artRepo.PutItemArtwork(ctx, &model.ItemArtwork{
++				ItemKind: model.KindArtistArtwork.Prefix(), ItemID: "ar-1", Hash: "oldhash",
++			})).To(Succeed())
++			Expect(svc.RemoveImage(ctx, consts.EntityArtist, "ar-1", (&refStore{}).hooks())).To(Succeed())
++			_, err := artRepo.GetItemArtwork(ctx, model.KindArtistArtwork, "ar-1", model.ImageTypePrimary)
++			Expect(err).To(MatchError(model.ErrNotFound))
++		})
++
++		It("keeps the file when artwork state cannot be cleared, but still queues convergence", func() {
++			path := writeOld("ar-1_test.jpg", "img")
++			artRepo.Err = errors.New("artwork table is gone")
++			defer func() { artRepo.Err = nil }()
++
++			Expect(svc.RemoveImage(ctx, consts.EntityArtist, "ar-1", (&refStore{current: "ar-1_test.jpg"}).hooks())).
++				To(Succeed())
++			Expect(path).To(BeAnExistingFile(), "stale state still names this path")
++			queued, err := queueRepo.DequeueBatch(ctx, 1000)
++			Expect(err).ToNot(HaveOccurred())
++			Expect(queued).To(ContainElement(HaveField("ItemID", "ar-1")))
+ 		})
+ 	})
+ 
+@@ -100,14 +343,7 @@ var _ = Describe("Uploader", func() {
+ 
+ 			_, err := artRepo.GetItemArtwork(ctx, model.KindArtistArtwork, "ar-1", model.ImageTypePrimary)
+ 			Expect(err).To(MatchError(model.ErrNotFound))
+-
+-			queued, err := queueRepo.DequeueBatch(ctx, 1000)
+-			Expect(err).ToNot(HaveOccurred())
+-			Expect(queued).To(ContainElement(SatisfyAll(
+-				HaveField("ItemKind", "ar"),
+-				HaveField("ItemID", "ar-1"),
+-				HaveField("Priority", model.ArtworkPriorityBump),
+-			)))
++			expectBumpQueued("ar-1")
+ 		})
+ 
+ 		It("is a no-op for an unknown entity type", func() {
+@@ -116,26 +352,33 @@ var _ = Describe("Uploader", func() {
+ 		})
+ 	})
+ 
+-	Describe("RemoveImage", func() {
+-		It("removes the file at the given path", func() {
+-			dir := filepath.Join(tmpDir, "artwork", "artist")
+-			Expect(os.MkdirAll(dir, 0755)).To(Succeed())
+-			path := filepath.Join(dir, "ar-1_test.jpg")
+-			Expect(os.WriteFile(path, []byte("img"), 0600)).To(Succeed())
++	Describe("sweepUploadedImages", func() {
++		It("reclaims stale candidates and unreferenced files, keeps referenced and recent ones", func() {
++			referenced := writeOld("ar-1_kept.jpg", "keep")
++			unreferenced := writeOld("ar-9_gone.jpg", "gone")
++			staleCandidate := artistFile(".ar-8_old.jpg.tmp123456")
++			recentCandidate := artistFile(".ar-7_fresh.jpg.tmp654321")
++			recentUnreferenced := writeOld("ar-6_recent.jpg", "recent")
++			Expect(os.WriteFile(staleCandidate, []byte("partial"), 0o600)).To(Succeed())
++			Expect(os.WriteFile(recentCandidate, []byte("partial"), 0o600)).To(Succeed())
+ 
+-			err := svc.RemoveImage(ctx, path)
+-			Expect(err).ToNot(HaveOccurred())
+-			Expect(path).ToNot(BeAnExistingFile())
+-		})
++			old := time.Now().Add(-2 * time.Hour)
++			Expect(os.Chtimes(unreferenced, old, old)).To(Succeed())
++			Expect(os.Chtimes(staleCandidate, old, old)).To(Succeed())
+ 
+-		It("succeeds when file does not exist", func() {
+-			err := svc.RemoveImage(ctx, "/nonexistent/file.jpg")
+-			Expect(err).ToNot(HaveOccurred())
+-		})
++			artistRepo := tests.CreateMockArtistRepo()
++			artistRepo.SetData(model.Artists{{ID: "ar-1", Name: "Kept", UploadedImage: "ar-1_kept.jpg"}})
++			ds.MockedArtist = artistRepo
+ 
+-		It("succeeds with empty path", func() {
+-			err := svc.RemoveImage(ctx, "")
++			removed, err := sweepUploadedImages(ctx, ds, time.Now().Add(-time.Hour))
+ 			Expect(err).ToNot(HaveOccurred())
++			Expect(removed).To(Equal(2))
++
++			Expect(referenced).To(BeAnExistingFile())
++			Expect(unreferenced).ToNot(BeAnExistingFile())
++			Expect(staleCandidate).ToNot(BeAnExistingFile())
++			Expect(recentCandidate).To(BeAnExistingFile(), "an in-flight candidate is inside the grace window")
++			Expect(recentUnreferenced).To(BeAnExistingFile())
+ 		})
+ 	})
+ })
+diff --git a/core/playlists/playlists.go b/core/playlists/playlists.go
+index c9bc03b97..dd33655f7 100644
+--- a/core/playlists/playlists.go
++++ b/core/playlists/playlists.go
+@@ -12,6 +12,7 @@ import (
+ 	"github.com/deluan/rest"
+ 	"github.com/navidrome/navidrome/conf"
+ 	"github.com/navidrome/navidrome/consts"
++	"github.com/navidrome/navidrome/core/artwork"
+ 	"github.com/navidrome/navidrome/log"
+ 	"github.com/navidrome/navidrome/model"
+ 	"github.com/navidrome/navidrome/model/request"
+@@ -53,12 +54,10 @@ type Playlists interface {
+ 	TracksRepository(ctx context.Context, playlistId string, refreshSmartPlaylist bool) rest.Repository[model.PlaylistTrack]
+ }
+ 
+-// ImageUploadService is a local interface satisfied by artwork.Uploader.
+-// Defined here to avoid an import cycle between core/artwork and core/playlists.
++// ImageUploadService is the cover-commit contract satisfied by artwork.Uploader.
+ type ImageUploadService interface {
+-	SetImage(ctx context.Context, entityType string, entityID string, name string, oldPath string, reader io.Reader, ext string) (filename string, err error)
+-	RemoveImage(ctx context.Context, path string) error
+-	EnqueueArtwork(ctx context.Context, entityType, entityID string)
++	SetImage(ctx context.Context, entityType, entityID, name string, reader io.Reader, ext string, commit artwork.CoverCommit) error
++	RemoveImage(ctx context.Context, entityType, entityID string, commit artwork.CoverCommit) error
+ }
+ 
+ type playlists struct {
+@@ -161,14 +160,19 @@ func (s *playlists) Delete(ctx context.Context, id string) error {
+ 		return err
+ 	}
+ 
+-	// Clean up custom cover image file if one exists
+-	if path := pls.UploadedImagePath(); path != "" {
+-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+-			log.Warn(ctx, "Failed to remove playlist image on delete", "path", path, err)
++	// Remove the entity (and its image reference) before unlinking the cover file, so a failed
++	// deletion can never leave a row pointing at a missing file; the periodic sweep reclaims the
++	// file when the unlink fails.
++	coverPath := pls.UploadedImagePath()
++	if err := s.ds.Playlist().Delete(ctx, id); err != nil {
++		return err
++	}
++	if coverPath != "" {
++		if err := os.Remove(coverPath); err != nil && !os.IsNotExist(err) {
++			log.Warn(ctx, "Failed to remove playlist image on delete", "path", coverPath, err)
+ 		}
+ 	}
+-
+-	return s.ds.Playlist().Delete(ctx, id)
++	return nil
+ }
+ 
+ func (s *playlists) Update(ctx context.Context, playlistID string,
+@@ -335,18 +339,14 @@ func (s *playlists) SetImage(ctx context.Context, playlistID string, reader io.R
+ 		return err
+ 	}
+ 
+-	oldPath := pls.UploadedImagePath()
+-	filename, err := s.imgUpload.SetImage(ctx, consts.EntityPlaylist, pls.ID, pls.Name, oldPath, reader, ext)
+-	if err != nil {
+-		return err
++	commit := artwork.CoverCommit{
++		Current: s.currentImage(playlistID),
++		Persist: func(ctx context.Context, filename string) error {
++			pls.UploadedImage = filename
++			return s.ds.Playlist().Put(ctx, pls)
++		},
+ 	}
+-
+-	pls.UploadedImage = filename
+-	if err := s.ds.Playlist().Put(ctx, pls); err != nil {
+-		return err
+-	}
+-	s.imgUpload.EnqueueArtwork(ctx, consts.EntityPlaylist, pls.ID)
+-	return nil
++	return s.imgUpload.SetImage(ctx, consts.EntityPlaylist, pls.ID, pls.Name, reader, ext, commit)
+ }
+ 
+ func (s *playlists) RemoveImage(ctx context.Context, playlistID string) error {
+@@ -355,14 +355,24 @@ func (s *playlists) RemoveImage(ctx context.Context, playlistID string) error {
+ 		return err
+ 	}
+ 
+-	if err := s.imgUpload.RemoveImage(ctx, pls.UploadedImagePath()); err != nil {
+-		return err
++	commit := artwork.CoverCommit{
++		Current: s.currentImage(playlistID),
++		Persist: func(ctx context.Context, _ string) error {
++			pls.UploadedImage = ""
++			return s.ds.Playlist().Put(ctx, pls)
++		},
+ 	}
++	return s.imgUpload.RemoveImage(ctx, consts.EntityPlaylist, pls.ID, commit)
++}
+ 
+-	pls.UploadedImage = ""
+-	if err := s.ds.Playlist().Put(ctx, pls); err != nil {
+-		return err
++// currentImage returns a hook reading the playlist's persisted cover filename, so the commit
++// re-checks the live reference under its lock before reclaiming any file.
++func (s *playlists) currentImage(playlistID string) func(context.Context) (string, error) {
++	return func(ctx context.Context) (string, error) {
++		current, err := s.ds.Playlist().Get(ctx, playlistID)
++		if err != nil {
++			return "", err
++		}
++		return current.UploadedImage, nil
+ 	}
+-	s.imgUpload.EnqueueArtwork(ctx, consts.EntityPlaylist, pls.ID)
+-	return nil
+ }
+diff --git a/server/nativeapi/artists.go b/server/nativeapi/artists.go
+index 91508c825..dabc83e37 100644
+--- a/server/nativeapi/artists.go
++++ b/server/nativeapi/artists.go
+@@ -10,6 +10,7 @@ import (
+ 	"github.com/deluan/rest"
+ 	"github.com/go-chi/chi/v5"
+ 	"github.com/navidrome/navidrome/consts"
++	"github.com/navidrome/navidrome/core/artwork"
+ 	"github.com/navidrome/navidrome/model"
+ 	"github.com/navidrome/navidrome/server"
+ )
+@@ -37,18 +38,21 @@ func (api *Router) uploadArtistImage() http.HandlerFunc {
+ 			}
+ 			return err
+ 		}
+-		oldPath := ar.UploadedImagePath()
+-		filename, err := api.imgUpload.SetImage(ctx, consts.EntityArtist, ar.ID, ar.Name, oldPath, reader, ext)
+-		if err != nil {
+-			return err
+-		}
+-		ar.UploadedImage = filename
+-		ar.UpdatedAt = new(time.Now())
+-		if err := api.ds.Artist().Put(ctx, ar, "uploaded_image", "updated_at"); err != nil {
+-			return err
++		commit := artwork.CoverCommit{
++			Current: func(ctx context.Context) (string, error) {
++				current, err := api.ds.Artist().Get(ctx, artistID)
++				if err != nil {
++					return "", err
++				}
++				return current.UploadedImage, nil
++			},
++			Persist: func(ctx context.Context, filename string) error {
++				ar.UploadedImage = filename
++				ar.UpdatedAt = new(time.Now())
++				return api.ds.Artist().Put(ctx, ar, "uploaded_image", "updated_at")
++			},
+ 		}
+-		api.imgUpload.EnqueueArtwork(ctx, consts.EntityArtist, ar.ID)
+-		return nil
++		return api.imgUpload.SetImage(ctx, consts.EntityArtist, ar.ID, ar.Name, reader, ext, commit)
+ 	})
+ }
+ 
+@@ -62,15 +66,20 @@ func (api *Router) deleteArtistImage() http.HandlerFunc {
+ 			}
+ 			return err
+ 		}
+-		if err := api.imgUpload.RemoveImage(ctx, ar.UploadedImagePath()); err != nil {
+-			return err
+-		}
+-		ar.UploadedImage = ""
+-		ar.UpdatedAt = new(time.Now())
+-		if err := api.ds.Artist().Put(ctx, ar, "uploaded_image", "updated_at"); err != nil {
+-			return err
++		commit := artwork.CoverCommit{
++			Current: func(ctx context.Context) (string, error) {
++				current, err := api.ds.Artist().Get(ctx, artistID)
++				if err != nil {
++					return "", err
++				}
++				return current.UploadedImage, nil
++			},
++			Persist: func(ctx context.Context, _ string) error {
++				ar.UploadedImage = ""
++				ar.UpdatedAt = new(time.Now())
++				return api.ds.Artist().Put(ctx, ar, "uploaded_image", "updated_at")
++			},
+ 		}
+-		api.imgUpload.EnqueueArtwork(ctx, consts.EntityArtist, ar.ID)
+-		return nil
++		return api.imgUpload.RemoveImage(ctx, consts.EntityArtist, ar.ID, commit)
+ 	})
+ }
+diff --git a/server/nativeapi/radios.go b/server/nativeapi/radios.go
+index 4bacbea7a..905fc18b7 100644
+--- a/server/nativeapi/radios.go
++++ b/server/nativeapi/radios.go
+@@ -9,6 +9,7 @@ import (
+ 	"github.com/deluan/rest"
+ 	"github.com/go-chi/chi/v5"
+ 	"github.com/navidrome/navidrome/consts"
++	"github.com/navidrome/navidrome/core/artwork"
+ 	"github.com/navidrome/navidrome/model"
+ 	"github.com/navidrome/navidrome/server"
+ )
+@@ -39,17 +40,20 @@ func (api *Router) uploadRadioImage() http.HandlerFunc {
+ 			}
+ 			return err
+ 		}
+-		oldPath := radio.UploadedImagePath()
+-		filename, err := api.imgUpload.SetImage(ctx, consts.EntityRadio, radio.ID, radio.Name, oldPath, reader, ext)
+-		if err != nil {
+-			return err
+-		}
+-		radio.UploadedImage = filename
+-		if err := api.ds.Radio().Put(ctx, radio, "UploadedImage"); err != nil {
+-			return err
++		commit := artwork.CoverCommit{
++			Current: func(ctx context.Context) (string, error) {
++				current, err := api.ds.Radio().Get(ctx, radioID)
++				if err != nil {
++					return "", err
++				}
++				return current.UploadedImage, nil
++			},
++			Persist: func(ctx context.Context, filename string) error {
++				radio.UploadedImage = filename
++				return api.ds.Radio().Put(ctx, radio, "UploadedImage")
++			},
+ 		}
+-		api.imgUpload.EnqueueArtwork(ctx, consts.EntityRadio, radio.ID)
+-		return nil
++		return api.imgUpload.SetImage(ctx, consts.EntityRadio, radio.ID, radio.Name, reader, ext, commit)
+ 	})
+ }
+ 
+@@ -63,14 +67,19 @@ func (api *Router) deleteRadioImage() http.HandlerFunc {
+ 			}
+ 			return err
+ 		}
+-		if err := api.imgUpload.RemoveImage(ctx, radio.UploadedImagePath()); err != nil {
+-			return err
+-		}
+-		radio.UploadedImage = ""
+-		if err := api.ds.Radio().Put(ctx, radio, "UploadedImage"); err != nil {
+-			return err
++		commit := artwork.CoverCommit{
++			Current: func(ctx context.Context) (string, error) {
++				current, err := api.ds.Radio().Get(ctx, radioID)
++				if err != nil {
++					return "", err
++				}
++				return current.UploadedImage, nil
++			},
++			Persist: func(ctx context.Context, _ string) error {
++				radio.UploadedImage = ""
++				return api.ds.Radio().Put(ctx, radio, "UploadedImage")
++			},
+ 		}
+-		api.imgUpload.EnqueueArtwork(ctx, consts.EntityRadio, radio.ID)
+-		return nil
++		return api.imgUpload.RemoveImage(ctx, consts.EntityRadio, radio.ID, commit)
+ 	})
+ }

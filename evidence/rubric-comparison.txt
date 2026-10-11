@@ -1,0 +1,10 @@
+navidrome project-01 上传封面一致提交
+Rubric ID：1｜状态：通过｜期望行为：首次上传和正常替换仍遵守现有权限、大小与格式校验；未设置自定义图时继续使用原有 artwork 来源，成功响应和图片读取行为不回归。｜实际观察：现有上传校验、无自定义封面解析链和成功入口保持，带 fts5 的 artwork、playlists、nativeapi、artwork/e2e、jellyfin/e2e 无缓存测试通过。｜直接证据：go test -count=1 -tags=fts5 ./core/artwork ./core/playlists ./server/nativeapi ./core/artwork/e2e ./server/jellyfin/e2e 全部通过；入口仍调用既有 parseImageRequest。
+Rubric ID：2｜状态：通过｜期望行为：上传流短读、写入或关闭失败时，最终图片路径不会出现半文件，实体引用与旧封面保持不变，后续重试能够成功。｜实际观察：stageCover 先写唯一候选并关闭，流复制或关闭错误删除候选，不触碰最终路径和实体引用。｜直接证据：core/artwork/uploader.go 的 stageCover 错误分支删除 tmp；uploader_test.go 的 failingReader 用例验证旧文件、引用和候选状态。
+Rubric ID：3｜状态：通过｜期望行为：候选文件完整但实体数据库更新失败时，请求返回错误且旧引用和旧图片继续可服务，新候选不会成为孤儿或被 resolver 提前发布。｜实际观察：不同路径先原子发布完整文件，Persist 失败后仅在实时引用未指向该文件且 mtime 仍匹配时回滚。｜直接证据：core/artwork/uploader.go SetImage 与 rollbackPublished；持久化失败和后来成功提交防误删测试通过。
+Rubric ID：4｜状态：通过｜期望行为：删除封面只有在实体引用能够共同提交时才使旧文件不可用；持久化失败不得留下指向缺失文件的记录。｜实际观察：RemoveImage 先持久化空引用，持久化失败直接返回且旧文件仍存在，成功后才刷新并删除。｜直接证据：core/artwork/uploader.go RemoveImage；uploader_test.go 验证 Persist 执行时文件存在及 Persist 失败保留文件。
+Rubric ID：5｜状态：未通过｜期望行为：实体提交后 artwork 刷新或排队失败具有可恢复结果，已提交的新引用不会被回滚成悬空状态，系统可重驱并最终让解析与读取看到同一完整图片。｜实际观察：实体引用已提交后，refreshArtwork 对 DeleteForItems 和 ArtworkQueue.Enqueue 的错误都只记录日志并返回；该请求结束时没有队列项或重试状态保证解析收敛。｜直接证据：core/artwork/uploader.go:304-316 明确两个错误只 log.Warn；uploader_test.go 只覆盖状态删除失败但入队成功。｜原因：artwork 状态删除和刷新入队同时失败后没有持久重驱记录｜影响：新引用已持久化时旧解析状态可继续被服务，直到额外读取或外部操作触发新的解析。｜证据位置：core/artwork/uploader.go:299-317
+Rubric ID：6｜状态：通过｜期望行为：同一实体的重试或并发替换具有确定的资源所有权，迟到的失败清理不会删除后来已提交的新图，旧文件和候选文件只在不再被引用时回收。｜实际观察：同一进程内按实体类型和 ID 串行化提交，回滚和旧文件回收同时复核实时引用与 mtime。｜直接证据：core/artwork/uploader.go lockCover、rollbackPublished、reclaimSuperseded；四路并发替换在 -race 下通过。
+Rubric ID：7｜状态：通过｜期望行为：艺术家、电台和播放列表三个现有入口对写入、数据库、刷新失败及成功提交表现出同一封面不变量，而不是只修复其中一个调用路径。｜实际观察：艺术家、电台与播放列表三个生产入口均改为 CoverCommit，并共同调用 Uploader.SetImage 和 RemoveImage。｜直接证据：server/nativeapi/artists.go、server/nativeapi/radios.go、core/playlists/playlists.go；相关包无缓存测试通过。
+
+关键验证：Go 测试均使用 -count=1；相关并发包使用 -race；SQLite FTS5 相关套件使用 -tags=fts5。

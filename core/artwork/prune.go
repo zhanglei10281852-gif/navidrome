@@ -59,5 +59,15 @@ func prune(ctx context.Context, ds model.DataStore, store *ImageStore) error {
 	if removed > 0 {
 		log.Info(ctx, "Artwork: Swept stray files", "count", removed)
 	}
+
+	// Reclaim upload candidates from crashed commits and covers no entity references. The same
+	// grace window protects a commit between publication and reference persistence.
+	uploadsRemoved, err := sweepUploadedImages(ctx, ds, cutoff)
+	if err != nil {
+		return err
+	}
+	if uploadsRemoved > 0 {
+		log.Info(ctx, "Artwork: Reclaimed unreferenced uploaded images", "count", uploadsRemoved)
+	}
 	return nil
 }
